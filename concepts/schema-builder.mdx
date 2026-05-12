@@ -1,0 +1,364 @@
+---
+title: "Configuring the Schema Builder in Drizzle Castor"
+description: "Learn how createSchemaBuilder works, the difference between strict and lenient mode, and how to chain builder methods to produce a CastorInstance."
+---
+
+The schema builder is the entry point for everything in Drizzle Castor. You call `createSchemaBuilder` once, chain configuration methods to register tables, profiles, policies, middleware, and logging, then call `.build()` to produce a `CastorInstance` — the object that exposes `repoFactory` and `subscribeToTelemetry`. Because each method returns a new or mutated builder, the entire configuration reads as a single fluent expression.
+
+## `createSchemaBuilder`
+
+`createSchemaBuilder` accepts three parameters and returns a `SchemaBuilder` instance.
+
+<ParamField path="db" type="AnyDatabase" required>
+  A Drizzle ORM database instance. Supported drivers: `BunSQLiteDatabase`, `BetterSQLite3Database`, `LibSQLDatabase`, `PostgresJsDatabase`, `NodePgDatabase`, `MySql2Database`, and `AnyD1Database`.
+</ParamField>
+
+<ParamField path="tables" type="readonly AnyTable[]" required>
+  An array of Drizzle table objects passed `as const`. These are the tables Castor will manage. Any table referenced in relations or `repoFactory` calls must appear here.
+</ParamField>
+
+<ParamField path="mode" type='"strict" | "lenient"' default='"lenient"'>
+  Controls access-control behaviour for tables that have no policy registered. See the section below for details.
+</ParamField>
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import { usersTable, postsTable, profilesTable } from "./schema";
+
+const db = drizzle("sqlite.db");
+
+const builder = createSchemaBuilder(db, [
+  usersTable,
+  postsTable,
+  profilesTable,
+] as const, "lenient");
+```
+
+## Strict vs lenient mode
+
+<Tabs>
+  <Tab title="lenient (default)">
+    When `mode` is `"lenient"`, any table that has no policy defined allows all actions for all profiles. This is safe for local development and internal tools, but you should switch to `"strict"` before exposing endpoints to untrusted callers.
+
+    ```typescript
+    const builder = createSchemaBuilder(db, tables, "lenient");
+    // Tables without a .policies() call allow every action.
+    ```
+  </Tab>
+  <Tab title="strict">
+    When `mode` is `"strict"`, every table must have an explicit policy. If a caller queries a table that has no policy, the unified RBAC middleware throws an `AccessDeniedError` immediately before touching the database.
+
+    ```typescript
+    const builder = createSchemaBuilder(db, tables, "strict");
+    // Every table referenced by repoFactory must have a policy registered.
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  Running in lenient mode emits a warning log at startup: `[Drizzle-Castor] Warning: Running in lenient mode. Unprotected tables will allow all actions by default.` Treat this as a reminder to harden your policies before production.
+</Warning>
+
+## Builder methods
+
+Every method below is available on the `SchemaBuilder` instance returned by `createSchemaBuilder`. Methods that require type-level changes (`.profiles()`, `.table()`) return a **new** builder carrying updated generics; all other methods mutate and return `this`.
+
+### `.profiles(profiles)`
+
+Registers the valid profile strings that callers may pass to repository methods. TypeScript uses this tuple to narrow the `profile` parameter across the entire instance.
+
+```typescript
+const builder = createSchemaBuilder(db, tables, "lenient")
+  .profiles(["default", "public", "admin", "user"] as const);
+```
+
+<Note>
+  Always declare profiles before calling `.policies()` so that TypeScript can enforce that policy keys match a declared profile name.
+</Note>
+
+### `.withLogger(config)`
+
+Configures the internal Pino-based logger. Accepts a `LoggerConfig` object with a `level` and an optional Quarkus-style `format` string.
+
+<ParamField path="config.level" type='"TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR"' default='"WARN"'>
+  Minimum log level to emit.
+</ParamField>
+
+<ParamField path="config.format" type="string">
+  Format string. Supports `%d{HH:mm:ss}` (datetime), `%p` (level), `%c` (category), `%t` (traceId), `%s` (message), and `%{key.path}` (ExecutionContext injection).
+</ParamField>
+
+```typescript
+const builder = createSchemaBuilder(db, tables)
+  .withLogger({
+    level: "INFO",
+    format: "%d{HH:mm:ss} %p [%c] (%t) %s",
+  });
+```
+
+### `.table(tableName, config)`
+
+Registers relation and soft-delete metadata for a named table. This is the primary way to teach Castor about your data model without touching the physical Drizzle schema.
+
+Each call returns a **new** `SchemaBuilder` with the table's config merged into the type-level metadata map, so TypeScript can validate relation paths used in queries.
+
+```typescript
+builder.table("users", {
+  oneToOne: [
+    {
+      relationName: "profile",
+      relatedTable: "profiles",
+      localKey: "users.id",
+      foreignKey: "profiles.userId",
+    },
+  ],
+  oneToMany: [
+    {
+      relationName: "posts",
+      relatedTable: "posts",
+      localKey: "users.id",
+      foreignKey: "posts.userId",
+    },
+  ],
+  softDelete: {
+    deleteValue: { deletedFlag: 1 },
+    restoreValue: { deletedFlag: 0 },
+  },
+});
+```
+
+See [Defining Table Relations](/concepts/relations) for the full set of relation types and the M:N `joinTable` shape.
+
+### `.policies(tableName, policy)` and `.policies(globalPolicy)`
+
+Registers an access-control policy. Two overloads are available.
+
+<Tabs>
+  <Tab title="Table-specific policy">
+    Pass a table name and a policy map where each key is a profile name. Values can be static config objects or async functions.
+
+    ```typescript
+    builder.policies("users", {
+      public: {
+        allowedActions: ["read"],
+        allowedProjections: ["name", "profile.bio"],
+        allowedFilters: ["name", "email", "settings.theme"],
+      },
+      admin: {
+        allowedActions: "*",
+        allowedSets: "*",
+        allowedProjections: "*",
+        allowedFilters: "*",
+        allowedSorts: "*",
+      },
+      user: async (ctx) => {
+        const isOwner = ctx.params.id === ctx.state.userId;
+        return {
+          allowedActions: isOwner ? ["read", "update"] : ["read"],
+          allowedSets: ["settings.theme", "persona.skills"],
+          allowedProjections: ["*"],
+          allowedFilters: "*",
+          allowedSorts: "*",
+        };
+      },
+    });
+    ```
+  </Tab>
+  <Tab title="Global fallback policy">
+    Pass a single async function that receives `(ctx, tableName, profiles)`. This applies to every table that does not have a table-specific policy.
+
+    ```typescript
+    builder.policies((ctx, tableName, profiles) => {
+      if (profiles.includes("admin")) return { allowedActions: "*" };
+      return { allowedActions: ["read"] };
+    });
+    ```
+  </Tab>
+</Tabs>
+
+### `.use(middleware, config?)`
+
+Registers a Koa-style middleware that wraps every repository action. Middlewares execute in registration order before the RBAC layer.
+
+<ParamField path="middleware" type="Middleware" required>
+  An async function `(ctx, next) => Promise<any>`. Call `next()` to pass control downstream.
+</ParamField>
+
+<ParamField path="config.tables" type="string | string[]">
+  Restrict this middleware to specific tables. If omitted, it applies to all tables.
+</ParamField>
+
+<ParamField path="config.actions" type="DbAction | DbAction[]">
+  Restrict this middleware to specific actions (`"create"`, `"read"`, `"update"`, `"softDelete"`, `"restore"`, `"hardDelete"`).
+</ParamField>
+
+```typescript
+builder.use(async (ctx, next) => {
+  console.log(`Executing ${ctx.action} on table ${ctx.tableName}`);
+  const result = await next();
+  console.log("Finished execution!");
+  return result;
+});
+```
+
+### `.on(type, handler)` and `.off(type, handler)`
+
+Subscribe or unsubscribe from telemetry events emitted via the internal `mitt` event bus. Events are emitted asynchronously and never block query execution.
+
+Available event types: `"execution"`, `"security"`, `"error"`, `"soft-deleted"`, `"restored"`, `"hard-deleted"`.
+
+```typescript
+builder.on("execution", (ev) => {
+  // ev: { action, tableName, duration, status, traceId }
+  myMetrics.histogram("db_latency", ev.duration, { table: ev.tableName });
+});
+
+builder.on("security", (ev) => {
+  console.warn(`[Audit] Security event on ${ev.tableName}: ${ev.message}`);
+});
+```
+
+### `.build()`
+
+Finalises configuration and returns a `CastorInstance`. Call this exactly once after all builder methods have been chained.
+
+<ResponseField name="db" type="AnyDatabase">
+  The original Drizzle database instance.
+</ResponseField>
+
+<ResponseField name="tables" type="readonly AnyTable[]">
+  The table array passed to `createSchemaBuilder`.
+</ResponseField>
+
+<ResponseField name="metadata" type="TMetadata">
+  The accumulated table configs registered via `.table()` calls.
+</ResponseField>
+
+<ResponseField name="repoFactory" type="(tableName: TName) => Repository">
+  Factory function that creates a fully typed repository for a named table. See [Working with Repositories](/concepts/repositories).
+</ResponseField>
+
+<ResponseField name="subscribeToTelemetry" type="(subscriber) => () => void">
+  Programmatic alternative to `.on()`. Returns an unsubscribe function.
+</ResponseField>
+
+## Full example
+
+The following example chains all builder methods in the order recommended for production use.
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import {
+  usersTable,
+  postsTable,
+  commentsTable,
+  profilesTable,
+  companiesTable,
+  groupsTable,
+  userGroups,
+} from "./schema";
+
+const db = drizzle("sqlite.db");
+
+export const schemaMetadataBuilder = createSchemaBuilder(
+  db,
+  [
+    usersTable,
+    postsTable,
+    commentsTable,
+    profilesTable,
+    companiesTable,
+    groupsTable,
+    userGroups,
+  ] as const,
+  "lenient",
+)
+  // 1. Declare valid profiles
+  .profiles(["default", "public", "admin", "user"] as const)
+
+  // 2. Configure structured logging
+  .withLogger({
+    level: "INFO",
+    format: "%d{HH:mm:ss} %p [%c] (%t) %s",
+  })
+
+  // 3. Register table relations and soft-delete config
+  .table("users", {
+    oneToOne: [
+      {
+        relationName: "profile",
+        relatedTable: "profiles",
+        localKey: "users.id",
+        foreignKey: "profiles.userId",
+      },
+    ],
+    oneToMany: [
+      {
+        relationName: "posts",
+        relatedTable: "posts",
+        localKey: "users.id",
+        foreignKey: "posts.userId",
+      },
+    ],
+    softDelete: {
+      deleteValue: { deletedFlag: 1 },
+      restoreValue: { deletedFlag: 0 },
+    },
+  })
+
+  // 4. Register access-control policies
+  .policies("users", {
+    public: {
+      allowedActions: ["read"],
+      allowedProjections: ["name", "profile.bio"],
+      allowedFilters: ["name", "email", "settings.theme"],
+    },
+    admin: {
+      allowedActions: "*",
+      allowedSets: "*",
+      allowedProjections: "*",
+      allowedFilters: "*",
+      allowedSorts: "*",
+    },
+  })
+
+  // 5. Register custom middleware
+  .use(async (ctx, next) => {
+    console.log(`[Audit] ${ctx.action} on ${ctx.tableName}`);
+    return next();
+  })
+
+  // 6. Subscribe to telemetry events
+  .on("execution", (ev) => {
+    myMetrics.histogram("db_latency", ev.duration, { table: ev.tableName });
+  });
+
+// Finalise and export the CastorInstance
+export const schemaMetadata = schemaMetadataBuilder.build();
+
+// Obtain a typed repository
+const userRepo = schemaMetadata.repoFactory("users");
+```
+
+<Tip>
+  Store the result of `.build()` in a module-level export so that repositories are created once and reused across your application, rather than rebuilt on every request.
+</Tip>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Working with Repositories" icon="database" href="/concepts/repositories">
+    Explore every repository method, factory helpers, and how TypeScript infers return types from your projection.
+  </Card>
+  <Card title="Access control policies" icon="shield" href="/access-control/policies">
+    Deep-dive into action-level and field-level RBAC configuration.
+  </Card>
+  <Card title="Middleware pipeline" icon="layers" href="/middleware/pipeline">
+    Learn how the Koa-style middleware stack wraps every database action.
+  </Card>
+  <Card title="API: createSchemaBuilder" icon="code" href="/api/create-schema-builder">
+    Full API reference for the builder factory function and all its parameters.
+  </Card>
+</CardGroup>

@@ -1,0 +1,411 @@
+---
+title: "FilterQuery — JSON Filter Syntax Reference"
+description: "Complete reference for the FilterQuery type: comparison, string, null, range, array, and logical operators with dot-notation path support."
+---
+
+`FilterQuery<T>` is the primary abstraction for expressing `WHERE` conditions in drizzle-castor. Instead of writing raw SQL, you construct a plain JavaScript object whose keys are dot-notation paths into your entity graph and whose values are operator objects. The library's AST compiler translates this object into dialect-aware Drizzle ORM expressions at runtime, automatically resolving joins for relational paths and JSON extraction functions for nested column paths.
+
+## Type definition
+
+```typescript
+type FilterQuery<T> = Partial<Conjunctions<T>> & {
+  [K in ValidPath<T>]?: FieldOperators<ValueAt<T, K>>;
+};
+```
+
+Every key must be a `ValidPath<T>` — a recursively flattened union of all dot-notation strings reachable within `T`, including relation traversals and JSON array indices. The value for each key is a `FieldOperators<V>` object, where `V` is the TypeScript type at that path. Operators that make no sense for a given type (for example, `$like` on a `number`) are excluded from `FieldOperators<V>` at compile time.
+
+## Path types
+
+A filter key can represent three distinct things:
+
+- **Direct column** — `"name"`, `"age"`, `"createdAt"`
+- **Relational path** — `"posts.title"`, `"posts.comments.content"` (resolved via configured `oneToMany` / `oneToOne` metadata)
+- **JSON sub-path** — `"settings.theme"`, `"persona.skills.0"` (resolved via dialect-specific JSON extraction)
+
+```typescript
+// Direct column
+{ name: { $like: "%John%" } }
+
+// Relational path (auto-JOIN)
+{ "posts.title": { $like: "%Drizzle%" } }
+
+// JSON column path
+{ "settings.theme": { $eq: "dark" } }
+
+// JSON array index
+{ "persona.skills.0": { $eq: "TypeScript" } }
+```
+
+## Operator reference
+
+<Tabs>
+  <Tab title="Comparison">
+    Comparison operators are available on every field type. They are defined by `ComparisonOps<T>`.
+
+    ```typescript
+    type ComparisonOps<T> = {
+      $eq?: T;
+      $ne?: T;
+    };
+    ```
+
+    <AccordionGroup>
+      <Accordion title="$eq — exact equality">
+        Generates a SQL `= value` condition. Accepts the exact TypeScript type of the target path.
+
+        ```typescript
+        // Find users with exactly this name
+        const result = await userRepo.searchMany({
+          filter: { name: { $eq: "Jane Doe" } }
+        }, "admin");
+
+        // Filter by a JSON property
+        const darkThemeUsers = await userRepo.searchMany({
+          filter: { "settings.theme": { $eq: "dark" } }
+        }, "public");
+        ```
+      </Accordion>
+
+      <Accordion title="$ne — not equal">
+        Generates a SQL `!= value` condition. Accepts the same type as `$eq`.
+
+        ```typescript
+        // Exclude a specific post author
+        const result = await userRepo.searchMany({
+          filter: { "posts.title": { $ne: "Draft" } }
+        }, "admin");
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="Orderable">
+    Range comparison operators are conditionally available only when the target field type extends `string | number | Date`. They are defined by `OrderableOps<T>`.
+
+    ```typescript
+    type OrderableOps<T> =
+      NonNullable<T> extends string | number | Date
+        ? { $gt?: T; $gte?: T; $lt?: T; $lte?: T }
+        : {};
+    ```
+
+    <AccordionGroup>
+      <Accordion title="$gt and $gte — greater than">
+        `$gt` maps to SQL `> value`. `$gte` maps to SQL `>= value`.
+
+        ```typescript
+        // Users older than 18
+        const adults = await userRepo.searchMany({
+          filter: { age: { $gt: 18 } }
+        }, "admin");
+
+        // Records created on or after a timestamp
+        const recent = await userRepo.searchMany({
+          filter: { createdAt: { $gte: Date.now() - 86_400_000 } }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$lt and $lte — less than">
+        `$lt` maps to SQL `< value`. `$lte` maps to SQL `<= value`.
+
+        ```typescript
+        // Batch-update all minors
+        await userRepo.updateMany(
+          { age: { $lt: 18 } },
+          { "settings.notifications": false },
+          "admin"
+        );
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="String">
+    String pattern operators are available only when the target path resolves to `string`. They are defined by `StringOps`.
+
+    ```typescript
+    type StringOps = {
+      $like?: string;
+      $ilike?: string;
+      $notLike?: string;
+      $notIlike?: string;
+    };
+    ```
+
+    <AccordionGroup>
+      <Accordion title="$like and $notLike — case-sensitive pattern">
+        Standard SQL `LIKE` pattern matching. Use `%` as a wildcard for zero or more characters, `_` for exactly one character.
+
+        ```typescript
+        // Posts whose title contains "Drizzle"
+        const result = await userRepo.searchOne({
+          filter: {
+            $or: [
+              { name: { $like: "%John%" } },
+              { "posts.title": { $like: "%Drizzle%" } }
+            ]
+          }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$ilike and $notIlike — case-insensitive pattern">
+        Case-insensitive `ILIKE` matching (PostgreSQL native; emulated on MySQL and SQLite).
+
+        ```typescript
+        const result = await userRepo.searchMany({
+          filter: { email: { $ilike: "%@example.com" } }
+        }, "admin");
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="Null">
+    Null-check operators work on every field regardless of type. They are defined by `NullOps`.
+
+    ```typescript
+    type NullOps = {
+      $isNull?: boolean;
+      $notIsNull?: boolean;
+    };
+    ```
+
+    <Warning>
+      The null operator is `$notIsNull`, not `$isNotNull`. Check your query.ts for the exact identifier before migrating from other query libraries.
+    </Warning>
+
+    <AccordionGroup>
+      <Accordion title="$isNull — check for NULL">
+        Pass `true` to generate `IS NULL`. Pass `false` to generate `IS NOT NULL` (same effect as `$notIsNull: true`).
+
+        ```typescript
+        // Users who have never set a zip code
+        const result = await userRepo.searchMany({
+          filter: { zipCode: { $isNull: true } }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$notIsNull — check for NOT NULL">
+        Pass `true` to generate `IS NOT NULL`.
+
+        ```typescript
+        // Posts that have at least one comment (relational path)
+        const result = await userRepo.searchMany({
+          filter: { "posts.comments.content": { $notIsNull: true } }
+        }, "public");
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="Collection">
+    Collection operators test membership. They are defined by `InOps<T>` and `BetweenOps<T>`.
+
+    ```typescript
+    type InOps<T> = {
+      $in?: ReadonlyArray<T>;
+      $notIn?: ReadonlyArray<T>;
+      $inArray?: ReadonlyArray<T>;
+      $notInArray?: ReadonlyArray<T>;
+    };
+
+    type BetweenOps<T> =
+      NonNullable<T> extends string | number | Date
+        ? { $between?: readonly [T, T]; $notBetween?: readonly [T, T] }
+        : {};
+    ```
+
+    <AccordionGroup>
+      <Accordion title="$in and $notIn — value membership">
+        `$in` generates SQL `IN (...)`. `$notIn` generates `NOT IN (...)`. The array is readonly and must contain values matching the field type.
+
+        ```typescript
+        // Fetch specific users by ID
+        const result = await userRepo.searchMany({
+          filter: { id: { $in: [1, 2, 3] as const } }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$inArray and $notInArray — array column membership">
+        Tests whether a scalar value is contained within an array-typed column (e.g., a PostgreSQL `text[]` or a JSON array column). Use these instead of `$in` when the column itself is the array.
+
+        ```typescript
+        // Users whose tags array contains "typescript"
+        const result = await userRepo.searchMany({
+          filter: { tags: { $inArray: ["typescript"] as const } }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$between and $notBetween — inclusive range">
+        Available only on `string | number | Date` paths. Accepts a readonly two-element tuple `[lower, upper]` and generates SQL `BETWEEN lower AND upper`.
+
+        ```typescript
+        // Users in a specific age range
+        const result = await userRepo.searchMany({
+          filter: { age: { $between: [18, 65] as const } }
+        }, "admin");
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="Array">
+    Array containment operators apply only when the target path resolves to a `ReadonlyArray` type. They are defined by `ArrayContainmentOps<T>`.
+
+    ```typescript
+    type ArrayContainmentOps<T> =
+      NonNullable<T> extends ReadonlyArray<infer U>
+        ? {
+            $arrayContains?: ReadonlyArray<U>;
+            $arrayContained?: ReadonlyArray<U>;
+            $arrayOverlaps?: ReadonlyArray<U>;
+          }
+        : {};
+    ```
+
+    <AccordionGroup>
+      <Accordion title="$arrayContains — column contains all values">
+        The column array must contain every element in the provided list. Maps to PostgreSQL `@>`, or a JSON equivalent on MySQL/SQLite.
+
+        ```typescript
+        // Users who have both skills listed
+        const result = await userRepo.searchMany({
+          filter: {
+            "persona.skills": {
+              $arrayContains: ["TypeScript", "Node.js"] as const
+            }
+          }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$arrayContained — column is contained by values">
+        Every element in the column array must appear in the provided list (the reverse of `$arrayContains`).
+
+        ```typescript
+        const result = await userRepo.searchMany({
+          filter: {
+            "persona.hobbies": {
+              $arrayContained: ["reading", "coding", "gaming"] as const
+            }
+          }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$arrayOverlaps — at least one common element">
+        The column array and the provided list must share at least one element. Maps to PostgreSQL `&&`.
+
+        ```typescript
+        const result = await userRepo.searchMany({
+          filter: {
+            tags: { $arrayOverlaps: ["featured", "popular"] as const }
+          }
+        }, "public");
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="Logical">
+    Logical operators combine multiple `FilterQuery` objects. They are defined by `Conjunctions<T>`.
+
+    ```typescript
+    type Conjunctions<T> = {
+      $not?: FilterQuery<T>;
+      $and?: FilterQuery<T>[];
+      $or?: FilterQuery<T>[];
+    };
+    ```
+
+    <AccordionGroup>
+      <Accordion title="$and — all conditions must match">
+        Generates SQL `(cond1 AND cond2 AND ...)`. All child `FilterQuery` objects in the array must be satisfied. Top-level sibling keys are implicitly `AND`-combined, so `$and` is most useful when you need explicit grouping.
+
+        ```typescript
+        const result = await userRepo.searchOne({
+          filter: {
+            $and: [
+              { age: { $gte: 18 } },
+              { "settings.theme": { $eq: "dark" } }
+            ]
+          }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$or — at least one condition must match">
+        Generates SQL `(cond1 OR cond2 OR ...)`. At least one child must be satisfied.
+
+        ```typescript
+        const result = await userRepo.searchOne({
+          filter: {
+            $or: [
+              { name: { $like: "%John%" } },
+              { "settings.theme": { $eq: "dark" } },
+              { "persona.skills.0": { $eq: "Node.js" } },
+              { "posts.title": { $like: "%Drizzle%" } }
+            ]
+          }
+        }, "admin");
+        ```
+      </Accordion>
+
+      <Accordion title="$not — negate a condition">
+        Wraps a single `FilterQuery` in SQL `NOT (...)`.
+
+        ```typescript
+        const result = await userRepo.searchMany({
+          filter: {
+            $not: { age: { $lt: 18 } }
+          }
+        }, "admin");
+        ```
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+</Tabs>
+
+## Complete operator type
+
+For reference, the full `FieldOperators<T>` intersection applied to a given path is:
+
+```typescript
+type FieldOperators<T> = ComparisonOps<T> &
+  OrderableOps<T> &
+  NullOps &
+  InOps<LeafType<T>> &
+  BetweenOps<T> &
+  ([NonNullable<T>] extends [string] ? StringOps : {}) &
+  ArrayContainmentOps<T>;
+```
+
+The conditional branches ensure that, for example, `$like` is only present when `T` extends `string`, and `$gt`/`$lt` are only present when `T` extends `string | number | Date`.
+
+## RBAC and field trimming
+
+When RBAC is active, the `allowedFilters` policy is evaluated before the filter reaches the AST compiler. Any field key not listed in `allowedFilters` is silently removed from the `FilterQuery` tree — including keys nested inside `$and`, `$or`, and `$not`. If trimming empties an entire conjunction, the remainder of the filter still executes normally.
+
+```typescript
+// Policy: public profile may only filter on name, email, settings.theme
+schemaMetadataBuilder.policies("users", {
+  public: {
+    allowedActions: ["read"],
+    allowedFilters: ["name", "email", "settings.theme"],
+  }
+});
+
+// This filter from the "public" profile — passwordHash key is silently stripped
+await userRepo.searchMany({
+  filter: {
+    name: { $like: "%Jane%" },
+    passwordHash: { $eq: "secret" } // removed before query execution
+  }
+}, "public");
+```

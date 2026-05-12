@@ -1,0 +1,291 @@
+---
+title: "TypeScript Type System and Inference in Drizzle Castor"
+description: "How Drizzle Castor uses recursive generics, conditional types, and DeepPick to enforce type-safe filters, operators, projections, and profiles at compile time."
+---
+
+Drizzle Castor is designed so that TypeScript catches incorrect queries at compile time, not at runtime. The type system is built from a chain of interlocking generics: `InferEntity` extracts your table shapes from Drizzle, `FlattenPaths` and `ValidPath` enforce which dot-notation strings are legal, `FieldOperators` restricts which operators are valid for each value type, and `DeepPick` shapes the inferred return type of each query to exactly match your `projection` array. This page explains how each piece works and how they compose.
+
+## Inferring entity shapes from Drizzle
+
+The foundation of the type system is extracting the row shape from a Drizzle table definition without asking you to write a redundant TypeScript interface. `InferEntity` and `InferModel` use Drizzle's native type inference utilities internally:
+
+```typescript
+// Drizzle schema (example/schema.ts)
+export const usersTable = sqliteTable("users", {
+  id: int("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  persona: text({ mode: 'json' }).$type<{ hobbies: string[]; skills: string[] }>(),
+  settings: text({ mode: 'json' }).$type<{
+    theme: string;
+    notifications: boolean;
+  }>(),
+});
+
+// drizzle-castor implicitly infers this as the entity type:
+type UserEntity = {
+  id: number;
+  name: string;
+  persona: { hobbies: string[]; skills: string[] } | null;
+  settings: { theme: string; notifications: boolean } | null;
+};
+```
+
+This inferred type flows into every generic downstream. You never have to declare `UserEntity` manually.
+
+## Path validation with FlattenPaths and ValidPath
+
+Querying by dot-notation (e.g., `"persona.skills.0"`) is only safe if TypeScript can verify that the path exists in the entity type. `FlattenPaths` generates the complete union of valid string paths by recursively traversing the inferred type up to a configurable depth (default: 5 levels):
+
+```typescript
+// src/types/query.ts
+export type FlattenPaths<T, Prefix extends string = "", Depth extends number = RecursiveDepth> =
+  [Depth] extends [never]
+    ? never
+    : NonNullable<T> extends ReadonlyArray<infer U>
+      ? | `${Prefix}${number}`
+        | FlattenPaths<U, `${Prefix}${number}.`, Prev[Depth]>
+      : T extends object
+        ? {
+            [K in keyof T]-?: K extends string | number
+              ? IsTraversable<T[K]> extends true
+                  ? | `${Prefix}${K}`
+                    | FlattenPaths<NonNullable<T[K]>, `${Prefix}${K}.`, Prev[Depth]>
+                  : `${Prefix}${K}`
+              : never;
+          }[keyof T]
+        : never;
+
+export type ValidPath<T> = FlattenPaths<T>;
+```
+
+For the `User` type with nested JSON columns, the generated union looks like:
+
+```typescript
+type User = {
+  id: number;
+  persona: {
+    skills: string[];
+    role: string;
+  };
+};
+
+// ValidPath<User> generates:
+// "id" | "persona" | "persona.skills" | "persona.skills.0" | "persona.role"
+type ValidUserPaths = ValidPath<User>;
+```
+
+Any string that is not in this union is a compile-time error:
+
+```typescript
+userRepo.searchOne({
+  filter: {
+    "persona.role": { $eq: "admin" }, // ✅ Valid — path exists
+    "persona.age":  { $eq: 25 },      // ❌ TypeScript Error: "persona.age" is not in ValidPath<User>
+  }
+});
+```
+
+## Operator gating with FieldOperators
+
+Not every SQL operator is meaningful for every data type. `$like` makes no sense on a number column. `$arrayContains` requires an array. `FieldOperators` uses conditional types to inspect the value type at the requested path and include only the operators that apply:
+
+```typescript
+// src/types/query.ts
+export type FieldOperators<T> = ComparisonOps<T>
+  & OrderableOps<T>           // $gt, $gte, $lt, $lte — only for string | number | Date
+  & NullOps                   // $isNull, $notIsNull — always available
+  & InOps<LeafType<T>>        // $in, $notIn, $inArray, $notInArray — always available
+  & BetweenOps<T>             // $between, $notBetween — only for string | number | Date
+  & ([NonNullable<T>] extends [string] ? StringOps : {})        // $like, $ilike — strings only
+  & ArrayContainmentOps<T>;   // $arrayContains, $arrayContained, $arrayOverlaps — arrays only
+```
+
+The practical effect at the call site:
+
+```typescript
+// If targeting a string path:
+filter: {
+  "name": { $like: "%John%", $ilike: "john" } // ✅ StringOps included for string paths
+}
+
+// If targeting a number path:
+filter: {
+  "id": { $gt: 10, $lte: 50 },  // ✅ OrderableOps included for numeric paths
+  "id": { $like: "%10%" }        // ❌ TypeScript Error: $like does not exist on number operators
+}
+
+// If targeting an array path:
+filter: {
+  "persona.skills": { $arrayContains: ["TypeScript"] } // ✅ ArrayContainmentOps included
+}
+```
+
+<Info>
+  The conditional `[NonNullable&lt;T&gt;] extends [string] ? StringOps : {}` pattern uses a tuple wrapper to prevent TypeScript from distributing the conditional over union types. This ensures that a `string | null` path still gets `StringOps` while a `number | null` path does not.
+</Info>
+
+## Shaping return types with DeepPick
+
+When you pass a `projection` array to a query, you want the TypeScript return type to reflect exactly the fields you asked for — not the full entity. `DeepPick` is a recursive mapped type that does this shaping:
+
+```typescript
+// src/types/query.ts
+export type DeepPick<T, P extends string> =
+  T extends ReadonlyArray<infer U>
+    ? DeepPick<U, P>[]
+    : {
+        [K in keyof T as Extract<
+          P, `${K & string}` | `${K & string}.${string}`
+        > extends never ? never : K]: Extract<P, `${K & string}`> extends never
+          ? DeepPick<NonNullable<T[K]>, Extract<P, `${K & string}.${string}`> extends
+              `${K & string}.${infer Rest}` ? Rest : never>
+            | Extract<T[K], null | undefined>
+          : T[K];
+      };
+```
+
+In practice, the inferred return type is shaped by your `projection` array:
+
+```typescript
+const user = await userRepo.searchOne({
+  projection: ["id", "persona.skills.0"]
+});
+
+// TypeScript infers `user` as:
+// {
+//   id: number;
+//   persona: {
+//     skills: string[];
+//   };
+// } | null
+```
+
+If you omit the `projection` field entirely, `DbQueryResult` defaults to the full `TEntity` type.
+
+## The SearchQuery type
+
+`SearchQuery<T>` brings `ValidPath`, `FieldOperators`, `OrderQuery`, and `DeepPick` together into the single type used by all read methods:
+
+```typescript
+// src/types/query.ts
+export type SearchQuery<T> = {
+  projection?: ValidPath<T>[];
+  filter?: FilterQuery<T>;
+  order?: OrderQuery<T>;
+  page?: number;
+  pageSize?: number;
+};
+
+export type FilterQuery<T> = Partial<Conjunctions<T>> & {
+  [K in ValidPath<T>]?: FieldOperators<ValueAt<T, K>>;
+};
+
+export type OrderQuery<T> = {
+  [K in ValidPath<T>]?: OrderFieldConfig;
+};
+```
+
+Every key in `filter` and `order` is constrained to `ValidPath<T>`, and every value in `filter` is constrained to `FieldOperators<ValueAt<T, K>>` where `K` is the specific path being queried.
+
+## SchemaBuilder generics and type propagation
+
+`createSchemaBuilder` is the root of the generic chain. By passing your tables as a `const` tuple, TypeScript infers the exact table names as a literal union:
+
+```typescript
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const);
+
+// TTableName is strictly typed to "users" | "posts"
+const userRepo = builder.build().repoFactory("users");
+```
+
+Because `repoFactory("users")` receives a literal `"users"`, the repository methods are permanently bound to the `UserEntity` type and its valid relational paths. Passing `"unknown_table"` is a compile-time error.
+
+The four generics that propagate through the builder are:
+
+| Generic      | Description                                                             |
+|--------------|-------------------------------------------------------------------------|
+| `TDb`        | The Drizzle database instance type. Determines dialect-specific behavior.|
+| `TTables`    | The `const` tuple of Drizzle table objects passed to the builder.       |
+| `TMetadata`  | The accumulated relation and soft-delete configuration for each table.  |
+| `TProfiles`  | A literal union of valid profile names derived from `builder.profiles()`.|
+
+## Profile type safety
+
+Calling `builder.profiles()` with a `const` array establishes a literal union that is checked everywhere profiles are referenced:
+
+```typescript
+// TYPE_SYSTEM.md example
+builder.profiles(['admin', 'guest'] as const);
+
+// Policy definitions are now checked against the literal union
+builder.policies('users', {
+  admin: { allowedActions: "*" }, // ✅ "admin" is in the union
+  super: { /* ... */ }            // ❌ TypeScript Error: "super" is not assignable to "admin" | "guest"
+});
+```
+
+The same literal union is checked when calling any repository method:
+
+```typescript
+await userRepo.searchOne({ filter: {} }, "admin");  // ✅ Valid
+await userRepo.searchOne({ filter: {} }, "owner");  // ❌ TypeScript Error
+```
+
+## UpdateSet type
+
+`UpdateSet<T>` uses `ValidPath` and `ValueAt` to ensure that the value type in a set payload matches the column or JSON property being updated:
+
+```typescript
+// src/types/query.ts
+export type UpdateSet<T> = {
+  [K in ValidPath<T>]?: ValueAt<T, K>;
+};
+```
+
+This means you cannot accidentally assign a `boolean` to a field that should be a `string`:
+
+```typescript
+await userRepo.updateOne(1, {
+  "settings.theme": "light",  // ✅ ValueAt<User, "settings.theme"> is string
+  "settings.notifications": "yes", // ❌ TypeScript Error: string is not assignable to boolean
+}, "admin");
+```
+
+## Telemetry event types
+
+The event bus is typed through `mitt`. Every event payload is a distinct interface, so subscribers can safely access fields without casting:
+
+```typescript
+// TYPE_SYSTEM.md
+type TelemetryEvents = {
+  execution: ExecutionEvent;       // latency, status, traceId
+  security: SecurityEvent;         // audit logs for field trimming
+  error: ErrorEvent;               // global exception details
+  "soft-deleted": MutationEvent;   // records affected by soft-delete
+  "restored": MutationEvent;       // records affected by restore
+  "hard-deleted": MutationEvent;   // records affected by permanent delete
+};
+
+// Subscribing is fully type-safe:
+builder.on('execution', (ev) => {
+  ev.duration; // inferred as number
+  ev.action;   // inferred as "read" | "create" | "update" | ...
+});
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="FilterQuery reference" icon="filter" href="/api/filter-query">
+    Full API reference for the `FilterQuery` type, all operators, and logical conjunctions.
+  </Card>
+  <Card title="SearchQuery reference" icon="search" href="/api/search-query">
+    Complete `SearchQuery` type reference with `projection`, `filter`, `order`, `page`, and `pageSize`.
+  </Card>
+  <Card title="Schema builder methods" icon="wrench" href="/api/schema-builder-methods">
+    How to call `builder.table()`, `builder.profiles()`, `builder.policies()`, and `builder.build()`.
+  </Card>
+  <Card title="Access control overview" icon="shield" href="/access-control/overview">
+    How the RBAC engine uses the profile literal union to enforce action-level and field-level policies.
+  </Card>
+</CardGroup>

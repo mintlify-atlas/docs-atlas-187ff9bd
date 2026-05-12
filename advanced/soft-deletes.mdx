@@ -1,0 +1,222 @@
+---
+title: "Native Soft Delete and Restore Operations"
+description: "Declare soft delete on any table and get automatic safety filters, soft-delete, restore, and hard-delete methods with built-in telemetry events."
+---
+
+A soft delete marks a record as deleted without physically removing the row from the database. This lets you recover accidentally deleted data, maintain audit trails, and keep referential integrity intact. Drizzle Castor bakes soft delete directly into the schema builder so you declare the behavior once and it is enforced everywhere — queries, joins, mutations, and telemetry — without extra code in your application layer.
+
+## Declaring soft delete on a table
+
+Soft delete is configured per table inside `builder.table()` using the `softDelete` option. You provide two objects: `deleteValue` describes what the flagged-as-deleted state looks like, and `restoreValue` describes the active state.
+
+```typescript
+schemaMetadataBuilder.table("users", {
+  // Enable soft delete capabilities automatically
+  softDelete: {
+    deleteValue: { deletedFlag: 1 },
+    restoreValue: { deletedFlag: 0 },
+  },
+});
+```
+
+This matches the `deletedFlag` column declared in the schema:
+
+```typescript
+// example/schema.ts
+export const usersTable = sqliteTable("users", {
+  id: int("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  email: text("email").unique().notNull(),
+  // ...
+  deletedFlag: int("deleted_flag").default(0),
+  deletedAt: int("deleted_at"),
+  deletedBy: text("deleted_by"),
+});
+```
+
+<Note>
+  The values in `deleteValue` and `restoreValue` can be static primitives, synchronous functions, or `Promise`-returning functions. Drizzle Castor resolves them via `resolveProviderValues()` immediately before each mutation, making dynamic values like `Date.now()` or an audit user ID straightforward to implement.
+</Note>
+
+## Automatic safety filters
+
+Once `softDelete` is configured, Drizzle Castor automatically injects a filter that excludes soft-deleted rows from every query and every JOIN on that table. The injection is handled by `injectSoftDeleteFilter()` in `src/helper/soft-delete-helper.ts` and is idempotent — it checks for duplicate conditions before appending.
+
+For a table configured with `deleteValue: { deletedFlag: 1 }`, every standard `searchOne`, `searchMany`, and `searchPage` call transparently applies:
+
+```sql
+WHERE (users.deleted_flag != 1 OR users.deleted_flag IS NULL)
+```
+
+The same filter is injected into `JOIN` conditions for related tables that also have soft delete configured, so soft-deleted posts are excluded when you join users to posts even if you never mention `deletedFlag` in your query.
+
+<Warning>
+  Calling `softDeleteOne` or `softDeleteMany` on a table that has no `softDelete` configuration in the schema builder will throw a runtime error. The `getSoftDeleteConfig` helper asserts that the config exists before proceeding.
+</Warning>
+
+## Soft-delete methods
+
+### Soft-deleting a single record
+
+`softDeleteOne(id, profile)` finds the record by primary key, verifies it is currently active (not already soft-deleted), and applies `deleteValue` in a single atomic transaction.
+
+```typescript
+// Soft-delete the user with id = 1
+const wasDeleted = await userRepo.softDeleteOne(1, "admin");
+// Returns true if the record was found and flagged, false otherwise
+```
+
+### Soft-deleting multiple records
+
+`softDeleteMany(filter, profile)` applies `deleteValue` to every row matching the filter. The filter syntax is the same JSON query language used everywhere else in the library.
+
+```typescript
+await userRepo.softDeleteMany(
+  { "settings.theme": { $eq: "light" } },
+  "admin"
+);
+```
+
+Internally, `softDeleteMany` uses `executeBatchMutation` which routes through Strategy A (RETURNING) for PostgreSQL and SQLite, or Strategy B (temporary table) for MySQL, ensuring the operation is race-condition free.
+
+## Restore methods
+
+### Restoring a single record
+
+`restoreOne(id, profile)` finds the record by primary key among soft-deleted rows and applies `restoreValue`.
+
+```typescript
+const wasRestored = await userRepo.restoreOne(1, "admin");
+```
+
+### Restoring multiple records
+
+`restoreMany(filter, profile)` applies `restoreValue` to every soft-deleted row matching the filter.
+
+```typescript
+await userRepo.restoreMany(
+  { age: { $gt: 18 } },
+  "admin"
+);
+```
+
+<Tip>
+  The `searchFilter` passed to the executor targets rows in the **deleted** state, and the `rehydrateFilter` targets rows in the **active** state after the restore completes. This two-phase filter design means the returned objects always reflect the final post-restore state.
+</Tip>
+
+## Querying soft-deleted records
+
+Standard search methods never return soft-deleted rows. Use the `searchDeleted*` variants to query the soft-deleted partition explicitly:
+
+```typescript
+// Find a single soft-deleted user
+const deletedUser = await userRepo.searchDeletedOne(
+  { filter: { id: { $eq: 1 } } },
+  "admin"
+);
+
+// Find all soft-deleted users matching a filter
+const deletedUsers = await userRepo.searchDeletedMany(
+  { filter: { age: { $lt: 18 } } },
+  "admin"
+);
+```
+
+These methods pass `mode: "deleted"` to `injectSoftDeleteFilter`, which inverts the safety condition to `WHERE deleted_flag = 1` instead of excluding it.
+
+## Hard delete methods
+
+Hard delete permanently removes a row. Unlike soft delete, the record cannot be recovered.
+
+```typescript
+// Permanently remove the user with id = 1
+const wasRemoved = await userRepo.hardDeleteOne(1, "admin");
+
+// Permanently remove all users matching a filter
+const count = await userRepo.hardDeleteMany(
+  { "settings.theme": { $eq: "light" } },
+  "admin"
+);
+```
+
+<Warning>
+  Hard delete is irreversible. The executor fetches and hydrates the record(s) **before** the `DELETE` so that telemetry events contain a snapshot of what was removed. After the `DELETE` runs there is nothing left to query.
+</Warning>
+
+## Telemetry events
+
+Every soft-delete, restore, and hard-delete operation emits a structured telemetry event on the asynchronous event bus. Subscribe via `builder.on()` to build audit logs or metrics.
+
+<AccordionGroup>
+  <Accordion title="soft-deleted event">
+
+```typescript
+builder.on("soft-deleted", (ev) => {
+  // ev.tableName  — the affected table (e.g., "users")
+  // ev.action     — always "softDelete"
+  // ev.records    — array of hydrated objects that were flagged
+  // ev.traceId    — unique ID for correlating with other log entries
+  auditLog.write({ event: "soft-deleted", ...ev });
+});
+```
+
+  </Accordion>
+  <Accordion title="restored event">
+
+```typescript
+builder.on("restored", (ev) => {
+  // ev.tableName  — the affected table
+  // ev.action     — always "restore"
+  // ev.records    — array of hydrated objects that were restored
+  // ev.traceId    — unique trace identifier
+  auditLog.write({ event: "restored", ...ev });
+});
+```
+
+  </Accordion>
+  <Accordion title="hard-deleted event">
+
+```typescript
+builder.on("hard-deleted", (ev) => {
+  // ev.tableName  — the affected table
+  // ev.action     — always "hardDelete"
+  // ev.records    — snapshot of objects captured before deletion
+  // ev.traceId    — unique trace identifier
+  auditLog.write({ event: "hard-deleted", ...ev });
+});
+```
+
+  </Accordion>
+</AccordionGroup>
+
+<Info>
+  All telemetry events are emitted asynchronously via microtask scheduling using `mitt`. The event emission never blocks the database transaction or the return value of the repository method.
+</Info>
+
+## Operation summary
+
+<CardGroup cols={2}>
+  <Card title="softDeleteOne / softDeleteMany" icon="trash" href="/api/delete-methods">
+    Marks records as deleted by writing `deleteValue`. Only targets currently active records. Returns `true` / count of affected rows.
+  </Card>
+  <Card title="restoreOne / restoreMany" icon="rotate-ccw" href="/api/delete-methods">
+    Writes `restoreValue` back to flagged records. Only targets currently soft-deleted records.
+  </Card>
+  <Card title="hardDeleteOne / hardDeleteMany" icon="circle-x" href="/api/delete-methods">
+    Permanently removes rows. Hydrates a snapshot before deletion for telemetry. Cannot be undone.
+  </Card>
+  <Card title="searchDeletedOne / searchDeletedMany" icon="search" href="/api/read-methods">
+    Queries the soft-deleted partition. Injects the inverse safety filter so only deleted rows are returned.
+  </Card>
+</CardGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Multi-dialect support" icon="database" href="/advanced/multi-dialect">
+    How the atomic mutation strategy differs between PostgreSQL/SQLite and MySQL.
+  </Card>
+  <Card title="Middleware and telemetry" icon="activity" href="/middleware/telemetry">
+    Full reference for the telemetry event bus and all event payload shapes.
+  </Card>
+</CardGroup>

@@ -1,0 +1,485 @@
+---
+title: "Repository Read Methods: search and query data"
+description: "Reference for drizzle-castor's typed read methods: searchOne, searchMany, searchPage, soft-deleted variants, and factory helpers for reusable query fragments."
+---
+
+The read methods on a `Repository` instance cover every querying pattern you need: fetching a single record, retrieving an unbounded list, paginating results, and querying soft-deleted records in isolation. All methods accept an optional `profile` argument that the RBAC engine uses to enforce field-level access control before any SQL is executed. The `query` parameter in every method uses dot-notation paths so you can filter, project, and sort across JSON columns and related tables with full TypeScript autocompletion.
+
+---
+
+## searchOne
+
+Returns the first record matching the query, or `null` if no match is found. The query is limited to one row internally, so it is always efficient regardless of the underlying table size.
+
+**Signature**
+
+```typescript
+searchOne<Q extends Pick<SearchQuery<TEntity>, "projection" | "filter" | "order">>(
+  query: Q,
+  profile?: string | string[],
+): Promise<DbQueryResult<TEntity, Q> | null>
+```
+
+### Parameters
+
+<ParamField path="query" type="object" required>
+  The query descriptor. Accepts `projection`, `filter`, and `order` — but not `page` or `pageSize`.
+
+  <Expandable title="query properties">
+    <ParamField path="query.projection" type="string[]">
+      An array of dot-notation field paths to include in the response. Omitting this returns all fields. Supports relation paths (`posts.title`), JSON paths (`settings.theme`), and array index paths (`persona.skills.0`).
+    </ParamField>
+    <ParamField path="query.filter" type="FilterQuery&lt;TEntity&gt;">
+      A structured filter object using operator keys (`$eq`, `$like`, `$or`, `$and`, etc.). Supports the same dot-notation paths as `projection`.
+    </ParamField>
+    <ParamField path="query.order" type="OrderQuery&lt;TEntity&gt;">
+      A map of dot-notation field paths to `"asc"` or `"desc"`, or an object with `direction`, `nulls`, and `aggregate` fields.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  The RBAC profile (or profiles) to evaluate. Defaults to `"default"` when omitted. Pass an array to merge the permissions of multiple profiles.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="DbQueryResult<TEntity, Q> | null">
+  When `projection` is provided, returns a deeply-picked subset of `TEntity` matching exactly the paths listed. When `projection` is omitted, returns the full entity shape. Returns `null` when no record matches.
+</ResponseField>
+
+### Example
+
+```typescript
+const user = await userRepo.searchOne(
+  {
+    projection: [
+      "name",
+      "profile.bio",            // 1:1 relation
+      "posts.title",            // 1:N relation
+      "settings.theme",         // JSON column extraction
+      "persona.skills.0",       // JSON array index
+    ],
+    filter: {
+      $or: [
+        { name: { $like: "%John%" } },
+        { "settings.theme": { $eq: "dark" } },
+        { "persona.skills.0": { $eq: "Node.js" } },
+        { "posts.title": { $like: "%Drizzle%" } },
+      ],
+    },
+    order: {
+      createdAt: "desc",
+      "posts.comments.createdAt": "desc",
+    },
+  },
+  "admin",
+);
+```
+
+The library automatically builds the required SQL `JOIN`s and JSON extraction functions. The raw rows are then hydrated into a clean nested object:
+
+```json
+{
+  "name": "John Doe",
+  "settings": { "theme": "dark" },
+  "persona": { "skills": ["Node.js"] },
+  "profile": { "bio": "Backend Developer" },
+  "posts": [
+    {
+      "title": "Learning Drizzle",
+      "comments": [{ "content": "Great post!" }]
+    }
+  ]
+}
+```
+
+---
+
+## searchMany
+
+Returns all records that match the query as an array. There is no built-in limit, so apply a `filter` or use `searchPage` for large tables.
+
+**Signature**
+
+```typescript
+searchMany<Q extends Omit<SearchQuery<TEntity>, "page" | "pageSize">>(
+  query: Q,
+  profile?: string | string[],
+): Promise<DbQueryResult<TEntity, Q>[]>
+```
+
+### Parameters
+
+<ParamField path="query" type="object" required>
+  Accepts `projection`, `filter`, and `order`. The `page` and `pageSize` fields are not accepted — use `searchPage` for pagination.
+
+  <Expandable title="query properties">
+    <ParamField path="query.projection" type="string[]">
+      Dot-notation field paths to include in every returned object.
+    </ParamField>
+    <ParamField path="query.filter" type="FilterQuery&lt;TEntity&gt;">
+      Structured filter with operator keys. Supports logical conjunctions (`$and`, `$or`, `$not`).
+    </ParamField>
+    <ParamField path="query.order" type="OrderQuery&lt;TEntity&gt;">
+      Sort directions per field path.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate against the access policy.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="DbQueryResult<TEntity, Q>[]">
+  An array of entities (or projected subsets). Returns an empty array when no records match.
+</ResponseField>
+
+### Example
+
+```typescript
+// Fetch all users ordered by creation date
+const users = await userRepo.searchMany(
+  {
+    order: { createdAt: "desc" },
+  },
+  "admin",
+);
+
+// Fetch users with a specific JSON field value
+const darkThemeUsers = await userRepo.searchMany(
+  {
+    projection: ["name", "settings.theme"],
+    filter: {
+      "settings.theme": { $eq: "dark" },
+    },
+  },
+  "public",
+);
+```
+
+---
+
+## searchPage
+
+Returns a paginated result set together with metadata about the total number of items and pages. Use this method whenever you need cursor-free offset pagination.
+
+**Signature**
+
+```typescript
+searchPage<Q extends SearchQuery<TEntity>>(
+  query: Q,
+  profile?: string | string[],
+): Promise<{
+  data: DbQueryResult<TEntity, Q>[];
+  meta: {
+    currentPage: number;
+    pageSize: number;
+    totalPages: number;
+    totalItems: number;
+  };
+}>
+```
+
+### Parameters
+
+<ParamField path="query" type="object" required>
+  The full `SearchQuery` including pagination controls.
+
+  <Expandable title="query properties">
+    <ParamField path="query.projection" type="string[]">
+      Dot-notation field paths to include in returned objects.
+    </ParamField>
+    <ParamField path="query.filter" type="FilterQuery&lt;TEntity&gt;">
+      Structured filter object with operator keys.
+    </ParamField>
+    <ParamField path="query.order" type="OrderQuery&lt;TEntity&gt;">
+      Sort directions per field path.
+    </ParamField>
+    <ParamField path="query.page" type="number" default="1">
+      The 1-indexed page number to fetch.
+    </ParamField>
+    <ParamField path="query.pageSize" type="number" default="10">
+      The number of records per page.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate against the access policy.
+</ParamField>
+
+### Return value
+
+<ResponseField name="data" type="DbQueryResult<TEntity, Q>[]">
+  The records for the requested page, hydrated into nested objects.
+</ResponseField>
+
+<ResponseField name="meta" type="object">
+  Pagination metadata.
+
+  <Expandable title="meta properties">
+    <ResponseField name="meta.currentPage" type="number">
+      The page number returned (mirrors the `page` input, defaulting to `1`).
+    </ResponseField>
+    <ResponseField name="meta.pageSize" type="number">
+      The number of records per page (mirrors the `pageSize` input, defaulting to `10`).
+    </ResponseField>
+    <ResponseField name="meta.totalPages" type="number">
+      Total number of pages calculated from `totalItems / pageSize`.
+    </ResponseField>
+    <ResponseField name="meta.totalItems" type="number">
+      Total number of records matching the filter across all pages.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+```typescript
+const result = await userRepo.searchPage(
+  {
+    page: 1,
+    pageSize: 10,
+    filter: { "posts.comments.content": { $isNull: false } },
+  },
+  "public",
+);
+
+// result.data  → array of up to 10 user objects
+// result.meta  → { currentPage: 1, pageSize: 10, totalPages: 5, totalItems: 42 }
+```
+
+---
+
+## searchDeletedOne
+
+Identical in signature to `searchOne`, but scopes the query to soft-deleted records only. Active records are excluded.
+
+**Signature**
+
+```typescript
+searchDeletedOne<Q extends Pick<SearchQuery<TEntity>, "projection" | "filter" | "order">>(
+  query: Q,
+  profile?: string | string[],
+): Promise<DbQueryResult<TEntity, Q> | null>
+```
+
+<Warning>
+  This method requires `softDelete` to be configured on the table via the schema builder. If the table has no soft-delete config, it will throw at runtime.
+</Warning>
+
+### Parameters
+
+<ParamField path="query" type="object" required>
+  Same structure as `searchOne`: accepts `projection`, `filter`, and `order`.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="DbQueryResult<TEntity, Q> | null">
+  The first matching soft-deleted record, or `null`.
+</ResponseField>
+
+### Example
+
+```typescript
+const deletedUser = await userRepo.searchDeletedOne(
+  {
+    projection: ["name", "email"],
+    filter: { name: { $eq: "Jane Doe" } },
+  },
+  "admin",
+);
+```
+
+---
+
+## searchDeletedMany
+
+Returns all soft-deleted records matching the query as an array.
+
+**Signature**
+
+```typescript
+searchDeletedMany<Q extends Omit<SearchQuery<TEntity>, "page" | "pageSize">>(
+  query: Q,
+  profile?: string | string[],
+): Promise<DbQueryResult<TEntity, Q>[]>
+```
+
+<Warning>
+  Requires `softDelete` to be configured on the table builder.
+</Warning>
+
+### Parameters
+
+<ParamField path="query" type="object" required>
+  Accepts `projection`, `filter`, and `order`.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="DbQueryResult<TEntity, Q>[]">
+  Array of soft-deleted entities, or an empty array if none match.
+</ResponseField>
+
+### Example
+
+```typescript
+const allDeleted = await userRepo.searchDeletedMany(
+  {
+    order: { createdAt: "desc" },
+  },
+  "admin",
+);
+```
+
+---
+
+## searchDeletedPage
+
+Returns a paginated result of soft-deleted records, with the same `meta` structure as `searchPage`.
+
+**Signature**
+
+```typescript
+searchDeletedPage<Q extends SearchQuery<TEntity>>(
+  query: Q,
+  profile?: string | string[],
+): Promise<{
+  data: DbQueryResult<TEntity, Q>[];
+  meta: {
+    currentPage: number;
+    pageSize: number;
+    totalPages: number;
+    totalItems: number;
+  };
+}>
+```
+
+<Warning>
+  Requires `softDelete` to be configured on the table builder.
+</Warning>
+
+### Parameters
+
+<ParamField path="query" type="object" required>
+  Full `SearchQuery` including `page` and `pageSize`.
+
+  <Expandable title="query properties">
+    <ParamField path="query.projection" type="string[]">
+      Dot-notation field paths to include.
+    </ParamField>
+    <ParamField path="query.filter" type="FilterQuery&lt;TEntity&gt;">
+      Filter applied to soft-deleted records only.
+    </ParamField>
+    <ParamField path="query.order" type="OrderQuery&lt;TEntity&gt;">
+      Sort directions per field path.
+    </ParamField>
+    <ParamField path="query.page" type="number" default="1">
+      1-indexed page number.
+    </ParamField>
+    <ParamField path="query.pageSize" type="number" default="10">
+      Records per page.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate.
+</ParamField>
+
+### Return value
+
+<ResponseField name="data" type="DbQueryResult<TEntity, Q>[]">
+  Soft-deleted records for the requested page.
+</ResponseField>
+
+<ResponseField name="meta" type="object">
+  Pagination metadata scoped to the deleted records set.
+
+  <Expandable title="meta properties">
+    <ResponseField name="meta.currentPage" type="number">
+      Current page number.
+    </ResponseField>
+    <ResponseField name="meta.pageSize" type="number">
+      Records per page.
+    </ResponseField>
+    <ResponseField name="meta.totalPages" type="number">
+      Total pages across all deleted records matching the filter.
+    </ResponseField>
+    <ResponseField name="meta.totalItems" type="number">
+      Total count of deleted records matching the filter.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+```typescript
+const page = await userRepo.searchDeletedPage(
+  { page: 1, pageSize: 20 },
+  "admin",
+);
+```
+
+---
+
+## Factory helpers
+
+These methods do not perform any database operation. They are type-narrowing helpers that let you define reusable query fragments with full TypeScript inference.
+
+### defineFilter
+
+```typescript
+defineFilter: (filter: FilterQuery<TEntity>) => FilterQuery<TEntity>
+```
+
+Validates and returns a `FilterQuery` object. Useful for building shared filter presets.
+
+```typescript
+const activeFilter = userRepo.defineFilter({
+  "settings.theme": { $eq: "dark" },
+});
+
+const user = await userRepo.searchOne({ filter: activeFilter }, "admin");
+```
+
+### defineProjection
+
+```typescript
+defineProjection: <P extends FlattenPaths<TEntity>[]>(p: P) => P
+```
+
+Validates an array of projection paths against the entity type. Autocomplete ensures only valid paths are accepted.
+
+```typescript
+const publicFields = userRepo.defineProjection(["name", "profile.bio"]);
+
+const users = await userRepo.searchMany({ projection: publicFields }, "public");
+```
+
+### defineQuery
+
+```typescript
+defineQuery: <Q extends SearchQuery<TEntity>["order"]>(query: Q) => Q
+```
+
+Validates an order query object for reuse across multiple calls.
+
+```typescript
+const defaultOrder = userRepo.defineQuery({ createdAt: "desc" });
+
+const users = await userRepo.searchMany({ order: defaultOrder }, "admin");
+```

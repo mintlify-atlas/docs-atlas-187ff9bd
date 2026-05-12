@@ -1,0 +1,274 @@
+---
+title: "Profiles: User Roles in Drizzle Castor RBAC"
+description: "Learn how to declare type-safe profiles, assign policies to them, and pass single or multiple profiles to repository methods for union-merged access control."
+---
+
+A profile is a string label that represents a role or persona executing a database operation — for example `"admin"`, `"user"`, or `"public"`. When you call any repository method, you pass the active profile as the last argument. The Unified RBAC engine looks up the policy registered for that profile on the target table, resolves the access rules, and applies them to the query before it reaches the database. Profiles are the bridge between who is making a request and what they are allowed to do.
+
+## Declaring profiles
+
+You declare the set of valid profiles on the schema builder by calling `.profiles()` with a `const`-typed string array. This call updates the TypeScript generics on the builder so that any subsequent `.policies()` call and any repository method call will only accept the declared profile names — passing an undeclared name is a compile-time error.
+
+```typescript
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const, "lenient")
+  .profiles(["default", "public", "admin", "user"] as const);
+```
+
+<Note>
+The `as const` assertion on the array is required for TypeScript to infer the literal types of each profile name. Without it, the array is inferred as `string[]` and you lose compile-time profile name validation.
+</Note>
+
+The `"default"` profile is always implicitly recognized by the RBAC engine as the fallback when no profile is passed to a repository method. Including it explicitly in the `.profiles()` call lets you define a specific policy for it.
+
+## Assigning policies to profiles
+
+Once profiles are declared, you register policies for each one using `builder.policies(tableName, policyMap)`. The policy map keys are the profile names you declared:
+
+```typescript
+builder
+  .profiles(["default", "public", "admin", "user"] as const)
+  .policies("users", {
+    // Read-only access for unauthenticated visitors
+    public: {
+      allowedActions: ["read"],
+      allowedFilters: ["name", "email", "settings.theme"],
+      allowedProjections: ["name", "profile.bio"],
+    },
+
+    // Full access for administrators
+    admin: {
+      allowedActions: "*",
+      allowedSets: "*",
+      allowedProjections: "*",
+      allowedFilters: "*",
+      allowedSorts: "*",
+    },
+
+    // Contextual access for authenticated users
+    user: async (ctx) => {
+      const isOwner = ctx.params.id === ctx.state.userId;
+      return {
+        allowedActions: isOwner ? ["read", "update"] : ["read"],
+        allowedSets: ["settings.theme", "persona.skills"],
+        allowedProjections: ["*"],
+        allowedFilters: "*",
+        allowedSorts: "*",
+      };
+    },
+  });
+```
+
+## Passing a profile to repository methods
+
+Every repository method accepts a profile as its last argument. The type of that argument is constrained to the union of the declared profile names, so TypeScript catches typos and undeclared roles at compile time.
+
+```typescript
+const schema = builder.build();
+const userRepo = schema.repoFactory("users");
+
+// Single profile — resolves the "admin" policy for this call
+const allUsers = await userRepo.searchMany({ order: { createdAt: "desc" } }, "admin");
+
+// Single profile — resolves the "public" policy
+const publicUser = await userRepo.searchOne(
+  { filter: { name: { $like: "%John%" } } },
+  "public"
+);
+
+// Single profile — resolves the "user" dynamic policy
+const myData = await userRepo.searchOne({ filter: { id: { $eq: 42 } } }, "user");
+```
+
+<Tip>
+If you are building an API layer, forward the authenticated user's role directly as the profile string. This keeps authorization logic in one place — the policy definitions on the schema builder — rather than duplicated across route handlers.
+</Tip>
+
+## Passing multiple profiles
+
+You can pass an array of profile strings instead of a single string. The RBAC engine evaluates each profile's policy independently and merges the results using **union semantics**:
+
+- If any profile grants a field, the field is granted in the merged result.
+- If any profile has `"*"` on a dimension, the merged result for that dimension is `"*"`.
+- Allowed actions are unioned: `["read"]` + `["read", "update"]` → `["read", "update"]`.
+
+```typescript
+// A user who holds both "public" and "editor" roles simultaneously
+const result = await userRepo.searchMany(
+  { projection: ["name", "email", "posts.title"] },
+  ["public", "editor"]
+);
+```
+
+This pattern is useful when a single authenticated session carries more than one role — for example, a user who is both a content editor and a billing manager. Pass all applicable profiles and let the engine compute the unified permission set at runtime.
+
+<Info>
+If an empty array is passed as the profiles argument, the engine falls back to `"default"` automatically. The same fallback applies when no profile argument is provided at all.
+</Info>
+
+## The `"default"` profile fallback
+
+Whenever a repository method is called without a profile argument, or with an empty array, the RBAC engine treats the active profile as `"default"`. Define a `default` entry in your policy map to establish a safe baseline for unauthenticated or anonymous operations:
+
+```typescript
+builder.policies("users", {
+  // Safe baseline: no access to anything by default
+  default: {
+    allowedActions: [],
+  },
+
+  public: {
+    allowedActions: ["read"],
+    allowedProjections: ["name", "profile.bio"],
+    allowedFilters: ["name"],
+  },
+
+  admin: {
+    allowedActions: "*",
+    allowedProjections: "*",
+    allowedFilters: "*",
+    allowedSets: "*",
+    allowedSorts: "*",
+  },
+});
+
+// Called without a profile — resolves the "default" policy
+await userRepo.searchMany({});
+```
+
+<Warning>
+In strict mode, if no policy is found for the active profile (including `"default"`), the middleware throws `AccessDeniedError`. Always define a `default` entry when operating in strict mode.
+</Warning>
+
+## TypeScript enforcement
+
+Calling `.profiles()` with `as const` causes the builder to carry the profile names as a type-level literal union. All downstream API surfaces — `builder.policies()` keys and repository method profile arguments — are constrained to that union. Passing a profile name that was not declared produces a TypeScript compile error.
+
+<Tabs>
+  <Tab title="Type-safe profile declaration">
+    ```typescript
+    const builder = createSchemaBuilder(db, tables, "lenient")
+      .profiles(["default", "public", "admin", "user"] as const);
+
+    // Valid — "admin" is in the declared list
+    await userRepo.searchMany({}, "admin");
+
+    // Valid — both profiles are declared
+    await userRepo.searchMany({}, ["public", "user"]);
+    ```
+  </Tab>
+  <Tab title="Type error on unknown profile">
+    ```typescript
+    // TypeScript error: Argument of type '"superuser"' is not assignable
+    // to parameter of type '"default" | "public" | "admin" | "user"'
+    await userRepo.searchMany({}, "superuser");
+    ```
+
+    <Note>
+    The compile-time error only works when you use `as const` on the array passed to `.profiles()`. Without it, TypeScript widens the type to `string` and the constraint is lost.
+    </Note>
+  </Tab>
+</Tabs>
+
+## End-to-end example
+
+The following example shows the full setup: declaring profiles, assigning policies, building the schema, and calling repository methods with different profiles.
+
+<Steps>
+  <Step title="Declare profiles on the builder">
+    ```typescript
+    import { drizzle } from "drizzle-orm/bun-sqlite";
+    import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+    import { usersTable, postsTable } from "./schema";
+
+    const db = drizzle("sqlite.db");
+
+    const builder = createSchemaBuilder(db, [usersTable, postsTable] as const, "lenient")
+      .profiles(["default", "public", "admin", "user"] as const);
+    ```
+  </Step>
+
+  <Step title="Assign policies for each profile">
+    ```typescript
+    builder.policies("users", {
+      public: {
+        allowedActions: ["read"],
+        allowedFilters: ["name", "email", "settings.theme"],
+        allowedProjections: ["name", "profile.bio"],
+      },
+      admin: {
+        allowedActions: "*",
+        allowedSets: "*",
+        allowedProjections: "*",
+        allowedFilters: "*",
+        allowedSorts: "*",
+      },
+      user: async (ctx) => {
+        const isOwner = ctx.params.id === ctx.state.userId;
+        return {
+          allowedActions: isOwner ? ["read", "update"] : ["read"],
+          allowedSets: ["settings.theme", "persona.skills"],
+          allowedProjections: ["*"],
+          allowedFilters: "*",
+          allowedSorts: "*",
+        };
+      },
+    });
+    ```
+  </Step>
+
+  <Step title="Build the schema and create a repository">
+    ```typescript
+    const schema = builder.build();
+    const userRepo = schema.repoFactory("users");
+    ```
+  </Step>
+
+  <Step title="Call repository methods with the appropriate profile">
+    ```typescript
+    // Admin: full access, no trimming
+    const allUsers = await userRepo.searchMany(
+      { order: { createdAt: "desc" } },
+      "admin"
+    );
+
+    // Public: only permitted projections and filters are applied
+    const publicView = await userRepo.searchOne(
+      {
+        projection: ["name", "profile.bio"],
+        filter: { name: { $like: "%Jane%" } },
+      },
+      "public"
+    );
+
+    // User: dynamic policy resolves based on execution context
+    const ownData = await userRepo.updateOne(
+      42,
+      { "settings.theme": "dark" },
+      "user"
+    );
+
+    // Multi-profile: union of "public" and "editor" permissions
+    const merged = await userRepo.searchMany(
+      { projection: ["name", "email"] },
+      ["public", "editor"]
+    );
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+Use profiles to model multi-tenant or multi-role scenarios. For multi-tenancy, encode the tenant identifier in `ctx.metadata` (passed at call time) and reference it inside dynamic policy callbacks to compute tenant-scoped field lists at runtime.
+</Tip>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Access control overview" icon="shield" href="/access-control/overview">
+    Understand the RBAC pipeline, strict vs lenient mode, and how union merging works in detail.
+  </Card>
+  <Card title="Defining policies" icon="file-shield" href="/access-control/policies">
+    Reference for `UnifiedPolicyConfig` fields, wildcard semantics, and global fallback policies.
+  </Card>
+</CardGroup>

@@ -1,0 +1,324 @@
+---
+title: "Repository Delete Methods: soft, hard, and restore"
+description: "Complete reference for drizzle-castor's typed delete methods: softDeleteOne, softDeleteMany, restoreOne, restoreMany, hardDeleteOne, and hardDeleteMany."
+---
+
+The delete methods on a `Repository` instance cover three distinct lifecycles: soft deletion (marking records as deleted while keeping them in the database), restoration (reversing a soft delete), and hard deletion (permanently removing rows). Soft-delete and restore operations require the `softDelete` configuration block to be present on the table in the schema builder. Hard-delete methods work on any table regardless of soft-delete configuration. All methods emit lifecycle events that you can subscribe to for audit trails and telemetry.
+
+<Warning>
+  `softDeleteOne`, `softDeleteMany`, `restoreOne`, and `restoreMany` all require `softDelete` to be configured on the table via `schemaMetadataBuilder.table("tableName", { softDelete: { ... } })`. Calling these methods on a table without that configuration will throw a runtime error.
+</Warning>
+
+---
+
+## softDeleteOne
+
+Marks a single active record as deleted by applying the `deleteValue` configured in the `softDelete` block. The record remains in the database and can be queried via `searchDeletedOne` or restored via `restoreOne`.
+
+**Signature**
+
+```typescript
+softDeleteOne(
+  id: string | number,
+  profile?: string | string[],
+): Promise<boolean>
+```
+
+Emits a `"soft-deleted"` event on success, carrying `tableName`, `action`, `records`, and `traceId`.
+
+### Parameters
+
+<ParamField path="id" type="string | number" required>
+  The primary key value of the record to soft-delete. The method only targets currently active (non-deleted) records; it will not re-delete an already soft-deleted record.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  The RBAC profile (or profiles) to evaluate. The `"softDelete"` action must be listed in `allowedActions` for the profile, otherwise an `AccessDeniedError` is thrown. Defaults to `"default"` when omitted.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="boolean">
+  `true` if a matching active record was found and soft-deleted. `false` if no active record with the given `id` exists.
+</ResponseField>
+
+### Example
+
+```typescript
+// Soft-delete a single user by primary key
+const wasDeleted = await userRepo.softDeleteOne(1, "admin");
+
+if (wasDeleted) {
+  console.log("User soft-deleted successfully.");
+} else {
+  console.log("No active user found with that ID.");
+}
+```
+
+---
+
+## softDeleteMany
+
+Applies a soft-delete to all active records matching a filter condition. Returns the count of records that were soft-deleted.
+
+**Signature**
+
+```typescript
+softDeleteMany(
+  filter: FilterQuery<TEntity>,
+  profile?: string | string[],
+): Promise<number>
+```
+
+Emits a `"soft-deleted"` event (with the full list of affected records) when at least one record is deleted.
+
+### Parameters
+
+<ParamField path="filter" type="FilterQuery&lt;TEntity&gt;" required>
+  A structured filter object using operator keys (`$eq`, `$like`, `$or`, `$and`, etc.) and dot-notation paths. Only currently active records are considered; soft-deleted records are excluded from the match automatically.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. The `"softDelete"` action must be permitted for the active profile.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="number">
+  The count of records that were soft-deleted. Returns `0` when no active records matched the filter.
+</ResponseField>
+
+### Example
+
+```typescript
+// Soft-delete all users who use the light theme
+const count = await userRepo.softDeleteMany(
+  { "settings.theme": { $eq: "light" } },
+  "admin",
+);
+
+console.log(`${count} user(s) soft-deleted.`);
+```
+
+---
+
+## restoreOne
+
+Reverses a soft delete on a single record by applying the `restoreValue` configured in the `softDelete` block. The record must currently be in the soft-deleted state; active records are not affected.
+
+**Signature**
+
+```typescript
+restoreOne(
+  id: string | number,
+  profile?: string | string[],
+): Promise<boolean>
+```
+
+Emits a `"restored"` event on success, carrying `tableName`, `action`, `records`, and `traceId`.
+
+### Parameters
+
+<ParamField path="id" type="string | number" required>
+  The primary key value of the soft-deleted record to restore. The method only targets records in the deleted state.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. The `"restore"` action must be listed in `allowedActions` for the active profile.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="boolean">
+  `true` if a matching soft-deleted record was found and restored. `false` if no soft-deleted record with the given `id` exists.
+</ResponseField>
+
+### Example
+
+```typescript
+// Restore a previously soft-deleted user
+const wasRestored = await userRepo.restoreOne(1, "admin");
+
+if (wasRestored) {
+  console.log("User restored successfully.");
+}
+```
+
+---
+
+## restoreMany
+
+Restores all soft-deleted records matching a filter condition. Returns the count of records that were restored.
+
+**Signature**
+
+```typescript
+restoreMany(
+  filter: FilterQuery<TEntity>,
+  profile?: string | string[],
+): Promise<number>
+```
+
+Emits a `"restored"` event (with the full list of restored records) when at least one record is restored.
+
+### Parameters
+
+<ParamField path="filter" type="FilterQuery&lt;TEntity&gt;" required>
+  A structured filter object. Only soft-deleted records are considered as candidates for restoration; active records are excluded automatically.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. The `"restore"` action must be permitted.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="number">
+  The count of records that were restored to active status. Returns `0` if no soft-deleted records matched.
+</ResponseField>
+
+### Example
+
+```typescript
+// Restore all soft-deleted users whose name contains "Alice"
+const count = await userRepo.restoreMany(
+  { name: { $like: "%Alice%" } },
+  "admin",
+);
+
+console.log(`${count} user(s) restored.`);
+```
+
+---
+
+## hardDeleteOne
+
+Permanently removes a single record from the database. This operation is irreversible. Unlike soft-delete methods, this works on any table regardless of soft-delete configuration, and targets the record in its current state — active or deleted.
+
+**Signature**
+
+```typescript
+hardDeleteOne(
+  id: string | number,
+  profile?: string | string[],
+): Promise<boolean>
+```
+
+Emits a `"hard-deleted"` event on success, carrying `tableName`, `action`, `records`, and `traceId`.
+
+### Parameters
+
+<ParamField path="id" type="string | number" required>
+  The primary key value of the record to permanently delete.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. The `"hardDelete"` action must be listed in `allowedActions` for the active profile.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="boolean">
+  `true` if a record with the given `id` was found and permanently deleted. `false` if no matching record existed.
+</ResponseField>
+
+### Example
+
+```typescript
+// Permanently delete a user record
+const wasDeleted = await userRepo.hardDeleteOne(1, "admin");
+
+if (wasDeleted) {
+  console.log("User permanently deleted.");
+}
+```
+
+<Warning>
+  Hard-deleted records cannot be recovered. If you need the ability to undo deletions, use `softDeleteOne` instead.
+</Warning>
+
+---
+
+## hardDeleteMany
+
+Permanently removes all records matching a filter condition. Returns the count of deleted records.
+
+**Signature**
+
+```typescript
+hardDeleteMany(
+  filter: FilterQuery<TEntity>,
+  profile?: string | string[],
+): Promise<number>
+```
+
+Emits a `"hard-deleted"` event (with the full list of deleted records) when at least one record is removed.
+
+### Parameters
+
+<ParamField path="filter" type="FilterQuery&lt;TEntity&gt;" required>
+  A structured filter object using operator keys and dot-notation paths. All records matching the filter — regardless of soft-delete state — are permanently removed.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. The `"hardDelete"` action must be permitted.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="number">
+  The count of records permanently deleted. Returns `0` if no records matched the filter.
+</ResponseField>
+
+### Example
+
+```typescript
+// Permanently remove all users younger than 13
+const count = await userRepo.hardDeleteMany(
+  { age: { $lt: 13 } },
+  "admin",
+);
+
+console.log(`${count} user(s) permanently deleted.`);
+```
+
+<Warning>
+  Hard-deleted records are gone forever and cannot be restored. Prefer `softDeleteMany` + `restoreMany` for workflows that require an undo capability.
+</Warning>
+
+---
+
+## Configuring soft delete
+
+For soft-delete and restore methods to function, the table must be configured with a `softDelete` block in the schema builder:
+
+```typescript
+schemaMetadataBuilder.table("users", {
+  softDelete: {
+    // Applied when softDeleteOne / softDeleteMany runs
+    deleteValue: { deletedFlag: 1 },
+    // Applied when restoreOne / restoreMany runs
+    restoreValue: { deletedFlag: 0 },
+  },
+});
+```
+
+The `deleteValue` and `restoreValue` objects map directly to column names on the physical table. Any column included in your Drizzle schema can be used — numeric flags, boolean columns, and nullable timestamp columns are all common choices.
+
+## Subscribing to lifecycle events
+
+All delete and restore methods emit named events that you can listen to for audit trails, cache invalidation, or external notifications:
+
+```typescript
+schemaMetadataBuilder.on("soft-deleted", (ev) => {
+  console.log(`Soft-deleted ${ev.records.length} record(s) from ${ev.tableName}`);
+});
+
+schemaMetadataBuilder.on("restored", (ev) => {
+  console.log(`Restored ${ev.records.length} record(s) in ${ev.tableName}`);
+});
+
+schemaMetadataBuilder.on("hard-deleted", (ev) => {
+  console.log(`Permanently deleted ${ev.records.length} record(s) from ${ev.tableName}`);
+});
+```

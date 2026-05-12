@@ -1,0 +1,92 @@
+---
+title: 'Drizzle Castor: Type-Safe CRUD Library for Drizzle ORM'
+description: 'Drizzle Castor is a type-safe CRUD library and DAO abstraction for Drizzle ORM with JSON querying, RBAC, and a middleware pipeline.'
+---
+
+Drizzle Castor is a type-safe CRUD library and Data Access Object (DAO) abstraction built on top of [Drizzle ORM](https://orm.drizzle.team/). It eliminates the repetitive boilerplate of writing raw Drizzle queries by providing a JSON-based querying syntax, an extensible middleware pipeline, unified Role-Based Access Control (RBAC), and multi-dialect execution strategies — all with full TypeScript inference from your existing Drizzle schema.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="JSON-based querying" icon="filter">
+    Filter, sort, and project relational data using intuitive JSON payloads. The AST translator compiles them into safe, optimised SQL at runtime.
+  </Card>
+  <Card title="Unified RBAC engine" icon="shield">
+    Built-in middleware-driven Role-Based Access Control. Enforce action-level and field-level security with declarative static maps or asynchronous policy callbacks.
+  </Card>
+  <Card title="Middleware pipeline" icon="layers">
+    Adopts the Koa-style onion model for absolute control flow (`await next()`) on every repository request. Compose custom plugins with ease.
+  </Card>
+  <Card title="Event-driven telemetry" icon="chart-bar">
+    Integrated event bus powered by `mitt`. Emits structured, non-blocking events for execution performance, security audits, and data mutations.
+  </Card>
+  <Card title="Hybrid logging" icon="scroll">
+    Quarkus-style pattern-based logging powered by `pino`. Supports context injection (traceId, parameters) and nested object traversal in log patterns.
+  </Card>
+  <Card title="Dialect agnostic" icon="database">
+    Supports PostgreSQL, MySQL, and SQLite. Handles dialect-specific logic such as `RETURNING` clauses versus temporary tables for atomic mutations.
+  </Card>
+  <Card title="Native soft deletes" icon="trash">
+    Declarative soft-delete capabilities that implicitly apply safety filters to every query and join — no manual `WHERE deleted_flag = 0` required.
+  </Card>
+  <Card title="Safe pagination" icon="book-open">
+    Leverages Common Table Expressions (CTEs) to prevent Cartesian fan-out when paginating one-to-many or many-to-many relationships.
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+Drizzle Castor implements a **middleware-driven repository pattern** that functions as an Abstract Syntax Tree (AST) transpiler. Every call to a repository method travels through a layered pipeline before reaching Drizzle ORM and your database.
+
+```text
+[ Application Logic ]
+        │
+        ▼
+[ Repository Interface ] (createOne, searchMany, etc.)
+        │
+        ▼
+[ Middleware Pipeline ] (Execution Context, RBAC, Custom Plugins)
+        │
+        ▼
+[ Executor Engine ] (single-executor, batch-executor)
+        │ (Uses Query Parser for AST compilation)
+        ▼
+[ Drizzle ORM ] -> [ Database Engine ]
+```
+
+Each layer has a single responsibility. The **Repository Interface** exposes strongly-typed methods that match your schema. The **Middleware Pipeline** intercepts every request, runs RBAC checks, emits telemetry events, and calls any custom plugins you register. The **Executor Engine** translates the parsed JSON AST into a concrete Drizzle query and handles dialect-specific differences. This separation means you can add cross-cutting concerns — logging, caching, rate-limiting — without modifying any business logic.
+
+## Technology stack
+
+| Concern | Library |
+|---|---|
+| Language | TypeScript 5+ |
+| Runtime | Bun 1.0+ or Node.js |
+| ORM | Drizzle ORM 0.30+ |
+| Logging | Pino |
+| Event bus | Mitt |
+| Validation / typing | Zod |
+| Testing | Bun Test, Node Test Runner, Testcontainers |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Drizzle Castor and run your first type-safe query in under five minutes.
+  </Card>
+  <Card title="Installation" icon="package" href="/installation">
+    Full installation options including npm, JSR, and peer dependency requirements.
+  </Card>
+  <Card title="Schema builder" icon="wrench" href="/concepts/schema-builder">
+    Learn how to configure tables, relations, and soft deletes with createSchemaBuilder.
+  </Card>
+  <Card title="Repositories" icon="server" href="/concepts/repositories">
+    Explore every repository method and understand the hydrated return format.
+  </Card>
+  <Card title="Access control" icon="lock" href="/access-control/overview">
+    Understand profiles, policies, and field-level data trimming.
+  </Card>
+  <Card title="Middleware pipeline" icon="layers" href="/middleware/pipeline">
+    Compose Koa-style middlewares and subscribe to telemetry events.
+  </Card>
+</CardGroup>

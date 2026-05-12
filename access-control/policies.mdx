@@ -1,0 +1,271 @@
+---
+title: "Defining RBAC Policies for Database Tables"
+description: "Learn how to write static, dynamic, and global RBAC policies in Drizzle Castor to control field-level access for every table in your schema."
+---
+
+Policies are the rules the Unified RBAC engine consults on every repository call. You register them on the schema builder via `builder.policies()`, which accepts either a table name and a per-table policy map or a single global callback that applies to all tables at once. The engine resolves the active policy at runtime from the current execution context, including the active profiles, and uses it to gate or trim the incoming query before it reaches the AST translator.
+
+## Table-specific policies
+
+The primary way to define access rules is to call `builder.policies(tableName, policyMap)`. The `policyMap` is a plain object whose keys are profile names (or `"default"`) and whose values are either a static `UnifiedPolicyConfig` object or an async function that returns one.
+
+```typescript
+schemaMetadataBuilder.policies("users", {
+  public: {
+    allowedActions: ["read"],
+    allowedFilters: ["name", "email", "settings.theme"],
+    allowedProjections: ["name", "profile.bio"],
+  },
+  admin: {
+    allowedActions: "*",
+    allowedSets: "*",
+    allowedProjections: "*",
+    allowedFilters: "*",
+    allowedSorts: "*",
+  },
+  user: async (ctx) => {
+    const isOwner = ctx.params.id === ctx.state.userId;
+    return {
+      allowedActions: isOwner ? ["read", "update"] : ["read"],
+      allowedSets: ["settings.theme", "persona.skills"],
+      allowedProjections: ["*"],
+      allowedFilters: "*",
+      allowedSorts: "*",
+    };
+  },
+});
+```
+
+The three approaches — static object, async function, and global callback — can be combined freely. Each is described in detail below.
+
+## The `UnifiedPolicyConfig` fields
+
+Every policy eventually resolves to a `UnifiedPolicyConfig` object. All fields are optional; omitting a field has no effect on that dimension (access is neither granted nor denied by the omission alone — the mode and trimming settings determine the outcome).
+
+<AccordionGroup>
+  <Accordion title="allowedActions" defaultOpen={true}>
+    <ParamField path="allowedActions" type="string[] | &quot;*&quot;">
+      An array of permitted action strings or the wildcard `"*"` for unrestricted access.
+
+      Valid action strings: `"create"`, `"read"`, `"update"`, `"softDelete"`, `"restore"`, `"hardDelete"`.
+
+      If the active profile attempts an action not in this list, the middleware throws `AccessDeniedError` before any field-level checks run.
+    </ParamField>
+  </Accordion>
+
+  <Accordion title="allowedProjections">
+    <ParamField path="allowedProjections" type="string[] | &quot;*&quot; | async (ctx) => string[] | &quot;*&quot;">
+      Restricts the `SELECT` clause. Accepts a static array, the wildcard `"*"`, or an async function that receives the `ExecutionContext` and returns one of those two.
+
+      Fields are matched using dot-notation path prefix rules: allowing `"settings"` implicitly permits any nested path such as `"settings.theme"` or `"settings.notifications.email"`.
+    </ParamField>
+  </Accordion>
+
+  <Accordion title="allowedFilters">
+    <ParamField path="allowedFilters" type="string[] | &quot;*&quot; | async (ctx) => string[] | &quot;*&quot;">
+      Restricts which fields may appear in `WHERE` clauses. The engine recursively traverses `$and`/`$or`/`$not` filter trees and discards nodes that reference disallowed fields.
+
+      Supports JSON dot-notation and relational paths (e.g., `"posts.title"`, `"settings.theme"`).
+    </ParamField>
+  </Accordion>
+
+  <Accordion title="allowedSets">
+    <ParamField path="allowedSets" type="string[] | &quot;*&quot; | async (ctx) => string[] | &quot;*&quot;">
+      Controls which columns may be written during `create` and `update` operations. Any key in the payload that is not in `allowedSets` is stripped before the mutation reaches the database.
+    </ParamField>
+  </Accordion>
+
+  <Accordion title="allowedSorts">
+    <ParamField path="allowedSorts" type="string[] | &quot;*&quot; | async (ctx) => string[] | &quot;*&quot;">
+      Limits which fields can appear in `ORDER BY` clauses. Disallowed sort keys are removed from the `order` object before the AST translator processes it.
+    </ParamField>
+  </Accordion>
+</AccordionGroup>
+
+## Policy modes
+
+<Tabs>
+  <Tab title="Static policy">
+    A static policy is a plain `UnifiedPolicyConfig` object assigned directly to a profile key. It is evaluated once at registration time and reused on every matching request without incurring async overhead.
+
+    Static policies are ideal for roles whose permissions do not change based on the request context — for example, an `admin` profile that always has full access.
+
+    ```typescript
+    schemaMetadataBuilder.policies("users", {
+      // Read-only: can filter by name, email, or a JSON sub-field
+      public: {
+        allowedActions: ["read"],
+        allowedFilters: ["name", "email", "settings.theme"],
+        allowedProjections: ["name", "profile.bio"],
+      },
+
+      // Full access: wildcard on every dimension
+      admin: {
+        allowedActions: "*",
+        allowedSets: "*",
+        allowedProjections: "*",
+        allowedFilters: "*",
+        allowedSorts: "*",
+      },
+    });
+    ```
+
+    <Tip>
+    Use `"*"` on a dimension to grant full access to that clause. Mixing `"*"` on some dimensions with explicit arrays on others is fully supported — each dimension is evaluated independently.
+    </Tip>
+  </Tab>
+
+  <Tab title="Dynamic policy">
+    A dynamic policy is an async function that receives the full `ExecutionContext` and returns a `UnifiedPolicyConfig`. It is called on every request, making it suitable for rules that depend on runtime data such as the current user's ID, tenant, or session state.
+
+    ```typescript
+    schemaMetadataBuilder.policies("users", {
+      // Dynamic policy: permissions differ for owner vs. non-owner
+      user: async (ctx) => {
+        const isOwner = ctx.params.id === ctx.state.userId;
+
+        return {
+          allowedActions: isOwner ? ["read", "update"] : ["read"],
+          allowedSets: ["settings.theme", "persona.skills"],
+          allowedProjections: ["*"],
+          allowedFilters: "*",
+          allowedSorts: "*",
+        };
+      },
+    });
+    ```
+
+    The `ExecutionContext` available inside the callback exposes:
+
+    - `ctx.action` — the current operation (`"read"`, `"update"`, etc.)
+    - `ctx.tableName` — the target table
+    - `ctx.profile` — the active profile string or array
+    - `ctx.params` — the raw query/data/filter/set payload
+    - `ctx.metadata` — user-supplied metadata passed at call time
+    - `ctx.state` — the middleware state bag, populated by earlier middleware
+
+    Individual field dimensions can also be functions. This lets you compute just that one dimension dynamically while keeping the rest static:
+
+    ```typescript
+    schemaMetadataBuilder.policies("users", {
+      user: {
+        allowedActions: ["read", "update"],
+        allowedSets: ["settings.theme", "persona.skills"],
+        // Compute allowed projections dynamically per request
+        allowedProjections: async (ctx) => {
+          const isSelf = ctx.params.id === ctx.state.userId;
+          return isSelf ? ["name", "email", "settings"] : ["name"];
+        },
+        allowedFilters: "*",
+        allowedSorts: "*",
+      },
+    });
+    ```
+  </Tab>
+
+  <Tab title="Global policy">
+    A global fallback policy is registered by passing a single function directly to `builder.policies()` — with no table name argument. The function receives the `ExecutionContext`, the `tableName` string, and the array of active profile names.
+
+    The global policy applies to every table that does **not** have a table-specific policy registered. If a table-specific policy exists, it takes precedence; the global callback is not called for that table.
+
+    ```typescript
+    // Global fallback: admins get full access everywhere; everyone else gets read-only
+    schemaMetadataBuilder.policies((ctx, tableName, profiles) => {
+      if (profiles.includes("admin")) {
+        return { allowedActions: "*" };
+      }
+      return { allowedActions: ["read"] };
+    });
+    ```
+
+    <Info>
+    The global policy callback signature is `(ctx, tableName, profiles) => UnifiedPolicyConfig | Promise<UnifiedPolicyConfig>`. It receives the full table name as a string, which you can use to apply different rules per table within a single function.
+    </Info>
+
+    You can combine a global policy with table-specific policies in the same builder. The engine always checks for a table-specific policy first:
+
+    ```typescript
+    schemaMetadataBuilder
+      // Global fallback for all other tables
+      .policies((ctx, tableName, profiles) => {
+        if (profiles.includes("admin")) return { allowedActions: "*" };
+        return { allowedActions: ["read"] };
+      })
+      // Table-specific override for "users"
+      .policies("users", {
+        public: {
+          allowedActions: ["read"],
+          allowedFilters: ["name", "email", "settings.theme"],
+          allowedProjections: ["name", "profile.bio"],
+        },
+        admin: {
+          allowedActions: "*",
+          allowedSets: "*",
+          allowedProjections: "*",
+          allowedFilters: "*",
+          allowedSorts: "*",
+        },
+        user: async (ctx) => {
+          const isOwner = ctx.params.id === ctx.state.userId;
+          return {
+            allowedActions: isOwner ? ["read", "update"] : ["read"],
+            allowedSets: ["settings.theme", "persona.skills"],
+            allowedProjections: ["*"],
+            allowedFilters: "*",
+            allowedSorts: "*",
+          };
+        },
+      });
+    ```
+  </Tab>
+</Tabs>
+
+## Wildcard `"*"` vs explicit field arrays
+
+Each field dimension accepts either `"*"` (full access) or an explicit array of dot-notation path strings.
+
+```typescript
+// Wildcard: no restrictions on projections
+allowedProjections: "*"
+
+// Explicit list: only these paths can appear in SELECT
+allowedProjections: ["name", "email", "profile.bio", "settings.theme"]
+```
+
+Path matching uses prefix semantics. Allowing `"settings"` automatically permits any descendant path, including `"settings.theme"`, `"settings.notifications"`, and `"settings.notifications.email"`. You never need to enumerate every leaf manually.
+
+```typescript
+// Allowing "settings" covers all nested JSON paths under it
+allowedFilters: ["name", "email", "settings"]
+
+// A query filtering on "settings.theme" or "settings.notifications.email" will pass
+```
+
+<Note>
+JSON dot-notation and relational paths follow the same prefix rules. Allowing `"posts"` in `allowedProjections` permits `"posts.title"`, `"posts.comments.content"`, and any other nested path under the `posts` relation.
+</Note>
+
+## Listening to RBAC security events
+
+Every time the engine trims a field or denies access, it emits a `security` event on the builder's event bus. Subscribe to it to build audit trails or forward security incidents to your logging infrastructure.
+
+```typescript
+schemaMetadataBuilder.on("security", (ev) => {
+  // ev.type: "field_trim" | "action_denied" | "unknown_operator"
+  // ev.tableName: the target table
+  // ev.fields: the fields involved
+  // ev.message: human-readable description
+  console.warn(`[Audit] Security event on ${ev.tableName}: ${ev.message}`);
+});
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Access control overview" icon="shield" href="/access-control/overview">
+    Understand strict vs lenient mode, the five control dimensions, and how Intelligent Data Trimming works.
+  </Card>
+  <Card title="Profiles" icon="users" href="/access-control/profiles">
+    Learn how to declare named profiles and pass single or multiple profiles to repository methods.
+  </Card>
+</CardGroup>

@@ -1,0 +1,392 @@
+---
+title: "JSON-Based Querying and Filter Operators"
+description: "Drizzle Castor's JSON filter syntax: comparison, logical, string, array, and null operators with dot-notation paths, projections, and order configuration."
+---
+
+Drizzle Castor expresses every `WHERE`, `SELECT`, and `ORDER BY` clause as a plain JavaScript object rather than a builder chain. You write a JSON payload, the AST translator pipeline converts it into dialect-aware Drizzle SQL, and the query executes without you authoring a single SQL string. This approach works identically across PostgreSQL, MySQL, and SQLite because the translator handles dialect differences internally.
+
+## How the filter syntax works
+
+A `FilterQuery<T>` is an object whose keys are dot-notation paths into the entity type and whose values are operator objects. The path can target a direct column, a nested JSON property inside a JSON column, or a column on a related table.
+
+```typescript
+const filter = userRepo.defineFilter({
+  age:              { $gte: 18 },
+  "settings.theme": { $eq: "dark" },
+  "posts.title":    { $like: "%Drizzle%" },
+});
+```
+
+TypeScript validates every path against the entity type via `FlattenPaths<TEntity>` and validates every operator value against the column's inferred type via `FieldOperators<ValueAt<TEntity, K>>`.
+
+## Comparison operators
+
+<AccordionGroup>
+  <Accordion title="$eq and $ne">
+    Exact equality and inequality checks.
+
+    ```typescript
+    filter: {
+      email: { $eq: "jane@example.com" },
+      role:  { $ne: "banned" },
+    }
+    ```
+  </Accordion>
+  <Accordion title="$gt, $gte, $lt, $lte">
+    Orderable comparisons. Available on `string`, `number`, and `Date` columns.
+
+    ```typescript
+    filter: {
+      age:       { $gte: 18, $lt: 65 },
+      createdAt: { $gt: new Date("2024-01-01") },
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## String operators
+
+Available on columns whose TypeScript type extends `string`.
+
+<AccordionGroup>
+  <Accordion title="$like and $notLike">
+    Case-sensitive pattern matching using SQL `LIKE` syntax. Use `%` for any sequence of characters.
+
+    ```typescript
+    filter: { name: { $like: "%John%" } }
+    filter: { name: { $notLike: "Spam%" } }
+    ```
+  </Accordion>
+  <Accordion title="$ilike and $notIlike">
+    Case-insensitive pattern matching (PostgreSQL) or fallback on other dialects.
+
+    ```typescript
+    filter: { email: { $ilike: "%@example.com" } }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Null operators
+
+```typescript
+filter: {
+  deletedAt: { $isNull:    true }, // column IS NULL
+  deletedAt: { $notIsNull: true }, // column IS NOT NULL
+}
+```
+
+## Range operators
+
+<AccordionGroup>
+  <Accordion title="$between and $notBetween">
+    Inclusive range check. Available on `string`, `number`, and `Date` columns.
+
+    ```typescript
+    filter: {
+      age:       { $between:    [18, 65] },
+      createdAt: { $notBetween: [new Date("2020-01-01"), new Date("2021-01-01")] },
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Set membership operators
+
+<AccordionGroup>
+  <Accordion title="$in and $notIn">
+    Check whether a column value appears in (or not in) a provided list.
+
+    ```typescript
+    filter: {
+      role: { $in:    ["admin", "editor"] },
+      id:   { $notIn: [5, 10, 15] },
+    }
+    ```
+  </Accordion>
+  <Accordion title="$inArray and $notInArray">
+    Database-level array membership operators (PostgreSQL array columns). Checks whether a scalar value appears in a database array column.
+
+    ```typescript
+    filter: {
+      tags: { $inArray:    ["typescript", "drizzle"] },
+      tags: { $notInArray: ["deprecated"] },
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Array containment operators
+
+Available on columns whose TypeScript type extends `ReadonlyArray`.
+
+```typescript
+filter: {
+  tags: { $arrayContains: ["typescript"] },  // array @> [value]
+  tags: { $arrayContained: ["a", "b", "c"] }, // array <@ [value]
+  tags: { $arrayOverlaps: ["node", "bun"] },  // array && [value]
+}
+```
+
+## Logical operators
+
+Logical operators accept nested `FilterQuery` objects. They can be arbitrarily nested.
+
+<Tabs>
+  <Tab title="$and">
+    All conditions must be true. This is the default behaviour when multiple keys are at the same level.
+
+    ```typescript
+    filter: {
+      $and: [
+        { age:  { $gte: 18 } },
+        { role: { $ne:  "banned" } },
+      ],
+    }
+    ```
+  </Tab>
+  <Tab title="$or">
+    At least one condition must be true.
+
+    ```typescript
+    filter: {
+      $or: [
+        { name:              { $like: "%John%" }    },
+        { "settings.theme":  { $eq:   "dark" }      },
+        { "posts.title":     { $like: "%Drizzle%" } },
+      ],
+    }
+    ```
+  </Tab>
+  <Tab title="$not">
+    Negates a nested filter.
+
+    ```typescript
+    filter: {
+      $not: {
+        role: { $eq: "banned" },
+      },
+    }
+    ```
+  </Tab>
+</Tabs>
+
+You can nest these freely:
+
+```typescript
+filter: {
+  $and: [
+    { age: { $gte: 18 } },
+    {
+      $or: [
+        { "settings.theme": { $eq: "dark" } },
+        { "posts.title":    { $like: "%Drizzle%" } },
+      ],
+    },
+  ],
+}
+```
+
+## Dot-notation paths
+
+Castor uses a single dot-notation string to address columns at any depth. The AST translator inspects the path and determines whether it points to a direct column, a JSON sub-property, or a related table column.
+
+### JSON column paths
+
+If a column is typed as a JSON object, append dot-separated keys to reach nested properties. Use a numeric index to target a JSON array element.
+
+```typescript
+// Access nested object property inside a JSON column
+filter: { "settings.theme":           { $eq: "dark"   } }
+filter: { "occupational.period.start": { $gt: new Date() } }
+
+// Access an array element by index
+filter: { "persona.skills.0":   { $eq: "TypeScript" } }
+filter: { "persona.hobbies.1":  { $eq: "Cycling"   } }
+```
+
+On PostgreSQL, these paths are compiled to `column #>> '{key}'`. On MySQL they use `->>`. On SQLite, `json_extract(column, '$.key')` is used.
+
+<Warning>
+  JSON paths pass through `validateJsonPath()` at query time. Paths are restricted to alphanumerics, dots, and array indices to prevent SQL injection and prototype pollution. Invalid paths throw a `QueryParsingError`.
+</Warning>
+
+### Relational paths
+
+If a column name resolves to a registered relation, Castor automatically emits the necessary `LEFT JOIN` before applying the filter or projection.
+
+```typescript
+filter: {
+  "posts.title":            { $like: "%Drizzle%" },
+  "posts.comments.content": { $eq:   "Great post!" },
+}
+```
+
+Nested relational paths — like `posts.comments.content` — generate two joins: one to `posts` and one to `comments`, each aliased uniquely (e.g., `rel_posts`, `rel_posts_comments`) to avoid ambiguous column names.
+
+## Projections
+
+A projection array selects which fields to return. Each entry is a dot-notation path validated against `FlattenPaths<TEntity>`. Omitting `projection` returns all columns on the base table.
+
+```typescript
+const user = await userRepo.searchOne({
+  projection: [
+    "name",
+    "profile.bio",            // 1:1 relation field
+    "posts.title",            // 1:N relation field
+    "posts.comments.content", // nested 1:N relation field
+    "settings.theme",         // JSON object property
+    "persona.skills.0",       // JSON array element
+  ],
+  filter: { id: { $eq: 1 } },
+}, "admin");
+```
+
+When a projection is supplied, the TypeScript return type narrows to only the requested paths:
+
+```typescript
+// Inferred type:
+// {
+//   name:     string;
+//   profile:  { bio: string | null };
+//   posts:    { title: string; comments: { content: string }[] }[];
+//   settings: { theme: string };
+//   persona:  { skills: string[] };
+// } | null
+```
+
+The hydrator collapses flat SQL rows into this nested shape automatically. For example, an `admin` user querying the example schema would receive:
+
+```json
+{
+  "name": "John Doe",
+  "settings": { "theme": "dark" },
+  "persona": { "skills": ["Node.js"] },
+  "profile": { "bio": "Backend Developer" },
+  "posts": [
+    {
+      "title": "Learning Drizzle",
+      "comments": [
+        { "content": "Great post!" },
+        { "content": "Thanks for sharing." }
+      ]
+    }
+  ]
+}
+```
+
+## Order query syntax
+
+The `order` field of a `SearchQuery` accepts a map from dot-notation paths to an `OrderFieldConfig`. The config can be a direction shorthand or a full configuration object.
+
+<Tabs>
+  <Tab title="Direction shorthand">
+    ```typescript
+    order: {
+      createdAt:               "desc",
+      "posts.comments.createdAt": "asc",
+    }
+    ```
+  </Tab>
+  <Tab title="Full config object">
+    ```typescript
+    order: {
+      createdAt: {
+        direction: "desc",
+        nulls:     "last",   // "first" | "last"
+      },
+      age: {
+        direction: "asc",
+        nulls:     "first",
+      },
+    }
+    ```
+  </Tab>
+  <Tab title="Aggregate ordering">
+    Order by an aggregate function (e.g., to sort by the number of posts per user).
+
+    ```typescript
+    order: {
+      "posts.id": {
+        direction: "desc",
+        aggregate: "count",  // "min" | "max" | "avg" | "sum" | "count"
+      },
+    }
+    ```
+
+    This compiles to `ORDER BY COUNT(rel_posts.id) DESC`.
+  </Tab>
+</Tabs>
+
+## The AST translator pipeline
+
+Every query object passes through a multi-stage pipeline before reaching Drizzle ORM:
+
+<Steps>
+  <Step title="RBAC trimming">
+    The unified RBAC middleware intercepts the raw payload and silently removes fields the active profile is not permitted to filter, project, sort, or set. Prohibited actions throw `AccessDeniedError` immediately.
+  </Step>
+  <Step title="Path analysis">
+    `analyzeQuery` traverses the filter, order, and projection trees and identifies every unique relational hop needed to satisfy the query (e.g., `Set(["posts", "posts.comments"])`).
+  </Step>
+  <Step title="Alias management">
+    `buildAliases` generates unique SQL table aliases for every hop (`rel_posts`, `rel_posts_comments`) to prevent ambiguous column names across joins.
+  </Step>
+  <Step title="AST compilation">
+    `parseFilter` recursively walks logical operators and leaf fields, mapping each operator to its Drizzle counterpart (`eq()`, `like()`, `and()`, etc.). `buildSelection` assembles the SELECT list; `parseOrder` builds the ORDER BY clause.
+  </Step>
+  <Step title="Join injection">
+    `applyJoins` emits `LEFT JOIN` statements for every alias in the map, wiring `localKey` to `foreignKey`. Soft-delete filters are injected into join conditions automatically.
+  </Step>
+  <Step title="Execution and hydration">
+    Drizzle executes the final SQL. `hydrateResults` folds flat aliased rows back into a nested JavaScript object matching the projection shape.
+  </Step>
+</Steps>
+
+## Complete query example
+
+The following query demonstrates all features — logical operators, JSON paths, relational paths, projections, and order — taken from the quickstart:
+
+```typescript
+const user = await userRepo.searchOne(
+  {
+    projection: [
+      "name",
+      "profile.bio",
+      "posts.title",
+      "posts.comments.content",
+      "settings.theme",
+      "persona.skills.0",
+    ],
+    filter: {
+      $or: [
+        { name:               { $like: "%John%" }    },
+        { "settings.theme":   { $eq:   "dark" }      },
+        { "persona.skills.0": { $eq:   "Node.js" }   },
+        { "posts.title":      { $like: "%Drizzle%" } },
+      ],
+    },
+    order: {
+      createdAt:                  "desc",
+      "posts.comments.createdAt": "desc",
+    },
+  },
+  "admin",
+);
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Defining table relations" icon="share-2" href="/concepts/relations">
+    Learn how relation metadata is registered so that relational paths resolve correctly.
+  </Card>
+  <Card title="Filter query API" icon="code" href="/api/filter-query">
+    Full type reference for FilterQuery, FieldOperators, and all operator types.
+  </Card>
+  <Card title="Search query API" icon="search" href="/api/search-query">
+    Full type reference for SearchQuery, OrderQuery, and projection inference.
+  </Card>
+  <Card title="Access control profiles" icon="user-check" href="/access-control/profiles">
+    Understand how RBAC trims filter and projection fields per profile.
+  </Card>
+</CardGroup>

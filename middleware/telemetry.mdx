@@ -1,0 +1,302 @@
+---
+title: "Event-Driven Telemetry and Observability in Drizzle Castor"
+description: "Subscribe to typed mitt events for executions, security decisions, and mutations. Handlers run asynchronously and never block your query execution path."
+---
+
+Drizzle Castor ships an event bus powered by [mitt](https://github.com/developit/mitt) that emits typed events at key points in the query lifecycle. Unlike middleware, telemetry events are fired asynchronously via microtask scheduling — they never block query execution or add latency to the hot path. You subscribe to events once at builder configuration time and receive a richly typed payload each time a matching event occurs.
+
+## The event bus
+
+The event bus is internal to the schema builder instance. Events are dispatched using `queueMicrotask`, which means handlers run after the current synchronous frame completes but before the next I/O tick. This guarantees that your database transaction finishes before telemetry handlers execute, so telemetry can never accidentally roll back or delay a commit.
+
+```typescript
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const, "lenient")
+  .profiles(["admin", "user", "public"] as const);
+
+// Subscribe to an event
+builder.on("execution", (ev) => {
+  metrics.histogram("db_latency", ev.duration, {
+    table: ev.tableName,
+    action: ev.action,
+  });
+});
+
+// Unsubscribe when no longer needed
+const handler = (ev) => console.log(ev);
+builder.on("security", handler);
+builder.off("security", handler);
+```
+
+## Available event types
+
+Drizzle Castor emits six distinct event types, each with its own payload shape. The complete `CastorEvents` type is defined in `src/types/telemetry.ts`.
+
+<Tabs>
+  <Tab title="execution">
+    Emitted after every repository action completes, whether it succeeded or failed. Use this event to record query latency, trace breadcrumbs, and per-table operation counts.
+
+    ```typescript
+    builder.on("execution", (ev: ExecutionEventPayload) => {
+      // ev.tableName   — target table name
+      // ev.action      — "create" | "read" | "update" | "softDelete" | "restore" | "hardDelete"
+      // ev.profile     — active RBAC profile string or array
+      // ev.params      — snapshot of the caller's input parameters
+      // ev.duration    — execution time in milliseconds
+      // ev.status      — "success" | "failed"
+      // ev.error       — Error object if status is "failed", otherwise undefined
+      // ev.traceId     — unique ID shared across the full request trace
+      // ev.spanId      — unique ID for this specific execution unit
+
+      console.log(`[${ev.traceId}] ${ev.action} on ${ev.tableName}: ${ev.status} in ${ev.duration}ms`);
+    });
+    ```
+
+    <Note>
+      `ev.duration` is measured in milliseconds with floating-point precision. It covers the entire pipeline including middleware and RBAC evaluation, not just the database round-trip.
+    </Note>
+  </Tab>
+
+  <Tab title="security">
+    Emitted when the RBAC middleware trims unpermitted fields or denies an action outright. Use this event to write security audit logs without coupling your access-control logic to your logging infrastructure.
+
+    ```typescript
+    builder.on("security", (ev: SecurityEventPayload) => {
+      // ev.type       — "field_trim" | "action_denied" | "unknown_operator"
+      // ev.tableName  — table where the security event occurred
+      // ev.message    — human-readable description of what happened
+      // ev.fields     — list of field names that were trimmed (for field_trim)
+      // ev.profiles   — profiles that were active at the time of the event
+      // ev.action     — the operation that was attempted or denied
+
+      if (ev.type === "action_denied") {
+        auditLog.write({
+          level: "WARN",
+          event: "access_denied",
+          table: ev.tableName,
+          profiles: ev.profiles,
+          action: ev.action,
+          message: ev.message,
+        });
+      }
+    });
+    ```
+  </Tab>
+
+  <Tab title="error">
+    Emitted for any unhandled exception thrown within the pipeline. Centralizes error reporting across all repository operations into a single handler.
+
+    ```typescript
+    builder.on("error", (ev: ErrorEventPayload) => {
+      // ev.error      — the thrown Error object
+      // ev.tableName  — table name if available
+      // ev.action     — action that was in progress if available
+      // ev.traceId    — trace ID for correlation with other events if available
+
+      errorTracker.captureException(ev.error, {
+        tags: { table: ev.tableName, action: ev.action },
+        extra: { traceId: ev.traceId },
+      });
+    });
+    ```
+  </Tab>
+
+  <Tab title="parser">
+    Emitted when the query AST is modified during translation. Use this event to inspect or log how filters, projections, or orders were rewritten before execution.
+
+    ```typescript
+    builder.on("parser", (ev) => {
+      // ev.rawQuery   — the original query payload before modification
+      // ev.reason     — description of why the query was modified
+      // ev.isModified — true when at least one modification was applied
+
+      if (ev.isModified) {
+        console.debug(`Query modified during AST translation: ${ev.reason}`);
+      }
+    });
+    ```
+  </Tab>
+
+  <Tab title="soft-deleted / restored / hard-deleted">
+    Emitted after a data mutation operation completes. These events carry the affected records, making them ideal for building audit trails or triggering downstream side-effects such as cache invalidation or webhook delivery.
+
+    ```typescript
+    builder.on("soft-deleted", (ev: MutationEventPayload) => {
+      // ev.tableName  — table where the mutation occurred
+      // ev.action     — "softDelete" | "restore" | "hardDelete"
+      // ev.records    — array of the affected records
+      // ev.traceId    — trace ID for correlation
+
+      auditLog.write({
+        event: "soft_delete",
+        table: ev.tableName,
+        recordCount: ev.records.length,
+        traceId: ev.traceId,
+      });
+    });
+
+    builder.on("restored", (ev: MutationEventPayload) => {
+      cache.invalidate(ev.tableName);
+    });
+
+    builder.on("hard-deleted", (ev: MutationEventPayload) => {
+      webhook.send("data.deleted", { table: ev.tableName, records: ev.records });
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Event payload type reference
+
+<AccordionGroup>
+  <Accordion title="ExecutionEventPayload">
+    ```typescript
+    interface ExecutionEventPayload {
+      tableName: string;
+      action: DbAction;
+      profile?: string | string[];
+      params: any;
+      duration: number;        // milliseconds
+      status: "success" | "failed";
+      error?: any;
+      traceId: string;
+      spanId: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="SecurityEventPayload">
+    ```typescript
+    type SecurityEventType = "field_trim" | "action_denied" | "unknown_operator";
+
+    interface SecurityEventPayload {
+      type: SecurityEventType;
+      tableName: string;
+      message: string;
+      fields?: string[];       // Fields that were trimmed (for field_trim)
+      profiles?: string[];     // Active profiles at event time
+      action?: DbAction;       // Attempted action
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="ErrorEventPayload">
+    ```typescript
+    interface ErrorEventPayload {
+      error: any;
+      tableName?: string;
+      action?: DbAction;
+      traceId?: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="MutationEventPayload">
+    ```typescript
+    interface MutationEventPayload {
+      tableName: string;
+      action: "softDelete" | "restore" | "hardDelete";
+      records: any[];
+      traceId: string;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="CastorEvents (full map)">
+    ```typescript
+    type CastorEvents = {
+      execution:    ExecutionEventPayload;
+      security:     SecurityEventPayload;
+      parser:       { rawQuery: any; reason: string; isModified: boolean };
+      error:        ErrorEventPayload;
+      "soft-deleted":  MutationEventPayload;
+      "restored":      MutationEventPayload;
+      "hard-deleted":  MutationEventPayload;
+    };
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Practical patterns
+
+### Sending metrics to a histogram
+
+```typescript
+builder.on("execution", (ev) => {
+  metrics.histogram("db_latency_ms", ev.duration, {
+    table: ev.tableName,
+    action: ev.action,
+    status: ev.status,
+  });
+
+  if (ev.status === "failed") {
+    metrics.increment("db_errors_total", {
+      table: ev.tableName,
+      action: ev.action,
+    });
+  }
+});
+```
+
+### Building a security audit log
+
+```typescript
+builder.on("security", (ev) => {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    type: ev.type,
+    table: ev.tableName,
+    profiles: ev.profiles?.join(",") ?? "unknown",
+    action: ev.action ?? "unknown",
+    message: ev.message,
+    trimmedFields: ev.fields ?? [],
+  };
+
+  // Write to your audit storage (file, database, SIEM, etc.)
+  auditStorage.append(entry);
+});
+```
+
+### Correlating events with traceId
+
+Every `execution` and `hard-deleted` event shares the same `traceId`. Use it to stitch together the full lifecycle of a single request across different event types:
+
+```typescript
+const traces = new Map<string, { start: number; events: string[] }>();
+
+builder.on("execution", (ev) => {
+  if (ev.status === "success") {
+    console.log(`Trace ${ev.traceId}: ${ev.action} on ${ev.tableName} completed in ${ev.duration}ms`);
+  }
+});
+
+builder.on("hard-deleted", (ev) => {
+  console.log(`Trace ${ev.traceId}: hard-deleted ${ev.records.length} records from ${ev.tableName}`);
+});
+```
+
+<Tip>
+  Because events are emitted asynchronously, they never add overhead to your repository's response time. Handlers that perform slow I/O (writing to a file, calling a remote API) are safe to use without throttling the query path.
+</Tip>
+
+<Warning>
+  Errors thrown inside event handlers are not propagated back to the caller. If a handler fails silently, you will not receive any indication in the query result. Wrap handler bodies in `try/catch` if reliability matters.
+</Warning>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Middleware pipeline" icon="layer-group" href="/middleware/pipeline">
+    Learn how to intercept and modify query execution using Koa-style middleware.
+  </Card>
+  <Card title="Logging" icon="file-lines" href="/middleware/logging">
+    Configure pattern-based structured logging with automatic traceId correlation.
+  </Card>
+  <Card title="Access Control overview" icon="shield" href="/access-control/overview">
+    Understand how the RBAC middleware enforces policies and emits security events.
+  </Card>
+  <Card title="Soft deletes" icon="trash-can-arrow-up" href="/advanced/soft-deletes">
+    See how soft-deleted, restored, and hard-deleted events integrate with soft-delete configuration.
+  </Card>
+</CardGroup>

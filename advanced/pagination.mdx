@@ -1,0 +1,197 @@
+---
+title: "Safe Pagination with CTE Split Queries"
+description: "How Drizzle Castor eliminates Cartesian fan-out in paginated one-to-many queries using a two-query CTE split strategy with exact LIMIT and OFFSET."
+---
+
+Paginating a query that joins one-to-many relationships is deceptively difficult. A naive `SELECT … JOIN … LIMIT 10` does not return 10 parent rows — it returns at most 10 **join result rows**, which may represent as few as one parent record if it has many children. This is called Cartesian fan-out, and it breaks `LIMIT`/`OFFSET` pagination silently. Drizzle Castor solves this with a CTE split query strategy that issues two coordinated queries: one to determine the exact set of paginated IDs, and one to hydrate those IDs with their full relation graph.
+
+## The Cartesian fan-out problem
+
+Consider users who each have multiple posts. A simple paginated join might look like:
+
+```sql
+-- WRONG: LIMIT applies to join rows, not to parent rows
+SELECT users.id, posts.title
+FROM users
+LEFT JOIN posts ON users.id = posts.user_id
+WHERE users.role = 'admin'
+ORDER BY users.created_at DESC
+LIMIT 10 OFFSET 0;
+```
+
+If the first admin user has 8 posts and the second has 5, this query returns rows for only those two users. You asked for 10 items but received data for 2, with page 2 starting mid-way through the second user's posts. The result is non-deterministic and unusable for a paginator.
+
+## The CTE split query solution
+
+Drizzle Castor's `buildSearchQueries` function solves this with a **two-query strategy** wrapped in a Common Table Expression:
+
+- **Query 1 — the CTE:** selects the exact paginated base IDs by applying `GROUP BY`, `ORDER BY`, `LIMIT`, and `OFFSET` on the parent table only. No one-to-many joins are applied here, so each row in the result represents exactly one parent record.
+- **Query 2 — the outer query:** takes the IDs returned by the CTE and `INNER JOIN`s them against the full relation graph. The join to one-to-many children happens only after the ID set is locked.
+
+```sql
+-- Query 1 (CTE): determine exactly which 10 users to fetch
+WITH "sq" AS (
+  SELECT "users"."id", "users"."created_at" AS __order_0
+  FROM "users"
+  WHERE "users"."role" = 'admin'
+  GROUP BY "users"."id"
+  ORDER BY "users"."created_at" DESC
+  LIMIT 10 OFFSET 0
+)
+
+-- Query 2 (main query): hydrate the full graph for only those 10 users
+SELECT
+  "users"."id",
+  "posts"."title",
+  "posts"."content"
+FROM "users"
+INNER JOIN "sq" ON "users"."id" = "sq"."id"
+LEFT JOIN "posts" ON "users"."id" = "posts"."user_id"
+ORDER BY "sq".__order_0 DESC;
+```
+
+The `INNER JOIN "sq"` on the outer query constrains it to precisely the 10 parent rows selected in the CTE, regardless of how many child rows each parent has.
+
+## The searchPage method
+
+`searchPage(query, profile)` is the public API for paginated results. It accepts a `SearchQuery` with `page` and `pageSize` parameters alongside the standard `filter`, `order`, and `projection` fields.
+
+```typescript
+const page = await userRepo.searchPage(
+  {
+    page: 1,
+    pageSize: 10,
+    filter: { "posts.comments.content": { $notIsNull: true } },
+    order: { createdAt: "desc" },
+    projection: ["name", "posts.title", "posts.comments.content"],
+  },
+  "public"
+);
+```
+
+### Return shape
+
+`searchPage` always returns an object with two keys: `data` and `meta`.
+
+```typescript
+// Return type of searchPage
+{
+  data: Array<{ name: string; posts: Array<{ title: string; comments: Array<{ content: string }> }> }>;
+  meta: {
+    currentPage: number;   // The page number that was fetched (mirrors query.page)
+    pageSize: number;      // Records per page (mirrors query.pageSize)
+    totalPages: number;    // Math.ceil(totalItems / pageSize)
+    totalItems: number;    // Total matching records before pagination
+  };
+}
+```
+
+A real response looks like:
+
+```json
+{
+  "data": [
+    {
+      "id": 1,
+      "name": "John Doe",
+      "posts": [
+        {
+          "id": 201,
+          "title": "Learning Drizzle",
+          "comments": [
+            { "id": 301, "content": "Great post!" }
+          ]
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "currentPage": 1,
+    "pageSize": 10,
+    "totalPages": 5,
+    "totalItems": 42
+  }
+}
+```
+
+<Info>
+  When `totalItems` is `0`, `searchPage` returns immediately without executing the main query. This short-circuit prevents unnecessary database round-trips for empty result sets.
+</Info>
+
+## How count and data queries are issued
+
+The `executeSearchPage` function in `src/queries/search.ts` issues two database round-trips:
+
+```typescript
+// src/queries/search.ts
+const { mainQuery, countQuery, paths } = await buildSearchQueries(
+  q as any,
+  translatorContext,
+  true, // isPaginated = true
+);
+
+// Round-trip 1: fetch totalItems
+const countResult = await countQuery;
+const totalItems = typeof totalItemsRaw === "bigint"
+  ? Number(totalItemsRaw)
+  : parseInt(String(totalItemsRaw), 10) || 0;
+
+// Round-trip 2: fetch the actual page data
+const rawRows = await mainQuery;
+const data = hydrateResults(rawRows, ctx.tableName, translatorContext.metadata, pkName, paths);
+```
+
+The count query runs against the CTE definition with `COUNT(*)` and no `LIMIT`. The main query uses the full CTE split structure described above. After the raw rows are returned, `hydrateResults` collapses the flat tabular output into the nested JSON shape.
+
+## Pagination parameters
+
+Both `page` and `pageSize` are optional fields on `SearchQuery`. Defaults are applied in the executor when they are absent.
+
+| Parameter  | Type     | Default | Description                             |
+|------------|----------|---------|-----------------------------------------|
+| `page`     | `number` | `1`     | One-indexed page number to fetch.       |
+| `pageSize` | `number` | `10`    | Number of parent records per page.      |
+
+```typescript
+// Fetch the third page with 25 records per page
+const page = await userRepo.searchPage(
+  { page: 3, pageSize: 25 },
+  "admin"
+);
+```
+
+## Choosing searchMany vs searchPage
+
+<CardGroup cols={2}>
+  <Card title="searchMany" icon="list" href="/api/read-methods">
+    Returns all matching records with no `LIMIT`. Use when you need every result and pagination is not relevant — for example, populating a dropdown, running a batch export, or seeding data.
+  </Card>
+  <Card title="searchPage" icon="book-open" href="/api/read-methods">
+    Returns a single page of results with exact `meta` counts. Use for any user-facing list view, infinite scroll, or API endpoint that a client will paginate through.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Avoid using `searchMany` as a workaround for large datasets. If the table has many rows, prefer `searchPage` with a large `pageSize` and iterate. `searchMany` with no filter on a large table will load every row into memory.
+</Tip>
+
+## Interaction with soft deletes and RBAC
+
+The CTE split query strategy operates downstream of both the soft-delete filter injection and the RBAC middleware. Before `buildSearchQueries` is called, `injectSoftDeleteFilter` has already appended the active-record condition to the `filter` object, and the RBAC engine has already trimmed any unpermitted fields from the projection and filter. The CTE receives the fully pre-processed query.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Multi-dialect support" icon="database" href="/advanced/multi-dialect">
+    How the CTE strategy is rendered for PostgreSQL, MySQL, and SQLite.
+  </Card>
+  <Card title="SearchQuery reference" icon="file-text" href="/api/search-query">
+    Full type reference for the `SearchQuery` object including all filter, order, and projection options.
+  </Card>
+  <Card title="Read methods reference" icon="book" href="/api/read-methods">
+    Complete API reference for `searchOne`, `searchMany`, `searchPage`, and the soft-deleted variants.
+  </Card>
+  <Card title="Native soft deletes" icon="trash" href="/advanced/soft-deletes">
+    How soft-delete filters are automatically injected before the CTE query is built.
+  </Card>
+</CardGroup>

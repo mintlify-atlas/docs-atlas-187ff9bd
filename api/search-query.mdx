@@ -1,0 +1,275 @@
+---
+title: "SearchQuery — Filtering, Sorting, and Pagination"
+description: "Reference for SearchQuery: projection, filter, order, page, and pageSize fields for searching, sorting, and paginating entity results."
+---
+
+`SearchQuery<T>` is the unified input type for all read operations in drizzle-castor. It collects every dimension of a query — which fields to return, how to filter rows, how to sort them, and how to paginate — into a single typed object. You pass it to `searchOne`, `searchMany`, or `searchPage` and the library's AST compiler handles the rest: building joins, injecting JSON extraction functions, and running the CTE split-query strategy for accurate pagination.
+
+## Type definition
+
+```typescript
+type SearchQuery<T> = {
+  projection?: ValidPath<T>[];
+  filter?: FilterQuery<T>;
+  order?: OrderQuery<T>;
+  page?: number;
+  pageSize?: number;
+};
+```
+
+All fields are optional. Omitting `projection` returns the full entity. Omitting `filter` removes the `WHERE` clause. Omitting `order` returns rows in database-natural order. `page` and `pageSize` are meaningful only when calling `searchPage`.
+
+## Fields
+
+<ParamField path="body.projection" type="string[]">
+  An array of `ValidPath<T>` strings selecting which fields to include in the result. Paths may reference direct columns, dot-notation JSON sub-paths, and relational traversals. Omit this field to return the full entity type.
+
+  When a relational path is included (for example `"posts.title"`), the compiler automatically fetches the related table's primary key as well — this is required for the hydration step that collapses flat SQL rows into nested JavaScript objects.
+
+  ```typescript
+  projection: [
+    "name",
+    "profile.bio",            // 1:1 relation
+    "posts.title",            // 1:N relation
+    "posts.comments.content", // nested 1:N relation
+    "settings.theme",         // JSON object path
+    "persona.skills.0"        // JSON array index
+  ]
+  ```
+</ParamField>
+
+<ParamField path="body.filter" type="FilterQuery<T>">
+  A `FilterQuery<T>` object describing `WHERE` conditions. Supports comparison, string, null, range, collection, array-containment, and logical operators. See the [FilterQuery reference](/api/filter-query) for the full operator list.
+
+  ```typescript
+  filter: {
+    $or: [
+      { name: { $like: "%John%" } },
+      { "settings.theme": { $eq: "dark" } },
+      { "posts.title": { $like: "%Drizzle%" } }
+    ]
+  }
+  ```
+</ParamField>
+
+<ParamField path="body.order" type="OrderQuery<T>">
+  An `OrderQuery<T>` object controlling the `ORDER BY` clause. Keys are `ValidPath<T>` strings; values are `OrderFieldConfig` (see below). Multiple keys are applied in the order they appear in the object.
+
+  ```typescript
+  order: {
+    createdAt: "desc",
+    "posts.comments.createdAt": { direction: "desc", nulls: "last" }
+  }
+  ```
+</ParamField>
+
+<ParamField path="body.page" type="number">
+  1-indexed page number. Only meaningful when calling `searchPage`. The first page is `1`.
+</ParamField>
+
+<ParamField path="body.pageSize" type="number">
+  Number of records per page. Only meaningful when calling `searchPage`.
+</ParamField>
+
+## OrderFieldConfig
+
+Each value in an `order` object is an `OrderFieldConfig`:
+
+```typescript
+type OrderDirection = "asc" | "desc";
+type NullsPosition = "first" | "last";
+type AggregateFunction = "min" | "max" | "avg" | "sum" | "count" | (string & {});
+
+type OrderFieldConfig =
+  | OrderDirection
+  | {
+      direction?: OrderDirection;
+      nulls?: NullsPosition;
+      aggregate?: AggregateFunction;
+    };
+```
+
+<AccordionGroup>
+  <Accordion title="Simple shorthand">
+    Pass `"asc"` or `"desc"` directly for a basic sort with no null-handling or aggregation.
+
+    ```typescript
+    order: {
+      createdAt: "desc",
+      name: "asc"
+    }
+    ```
+
+    Translates to:
+
+    ```sql
+    ORDER BY "users"."created_at" DESC, "users"."name" ASC
+    ```
+  </Accordion>
+
+  <Accordion title="Null position control">
+    Use the object form with `nulls: "first"` or `nulls: "last"` to control where `NULL` values appear in the result set.
+
+    ```typescript
+    order: {
+      "posts.comments.createdAt": {
+        direction: "desc",
+        nulls: "last"
+      }
+    }
+    ```
+
+    Translates to:
+
+    ```sql
+    ORDER BY "rel_posts_comments"."created_at" DESC NULLS LAST
+    ```
+  </Accordion>
+
+  <Accordion title="Aggregate ordering">
+    Set `aggregate` to apply an aggregation function before ordering. This is useful when grouping results by a related field and ordering by a derived value such as comment count.
+
+    Supported values: `"min"`, `"max"`, `"avg"`, `"sum"`, `"count"`.
+
+    ```typescript
+    order: {
+      id: { aggregate: "count", direction: "desc" }
+    }
+    ```
+
+    Translates to:
+
+    ```sql
+    ORDER BY COUNT("users"."id") DESC
+    ```
+
+    You can also pass an arbitrary SQL function name as a string for advanced use cases, as the `AggregateFunction` type includes `string & {}` to allow this.
+  </Accordion>
+</AccordionGroup>
+
+## Usage examples
+
+### Fetch a single record with deep relations
+
+```typescript
+const user = await userRepo.searchOne({
+  projection: [
+    "name",
+    "profile.bio",
+    "posts.title",
+    "posts.comments.content",
+    "settings.theme",
+    "persona.skills.0"
+  ],
+  filter: {
+    $or: [
+      { name: { $like: "%John%" } },
+      { "settings.theme": { $eq: "dark" } },
+      { "persona.skills.0": { $eq: "Node.js" } },
+      { "posts.title": { $like: "%Drizzle%" } }
+    ]
+  },
+  order: {
+    createdAt: "desc",
+    "posts.comments.createdAt": "desc"
+  }
+}, "admin");
+```
+
+The hydrated result collapses the flat SQL rows into a nested object:
+
+```json
+{
+  "id": 1,
+  "name": "John Doe",
+  "settings": { "theme": "dark" },
+  "persona": { "skills": ["Node.js"] },
+  "profile": { "bio": "Backend Developer" },
+  "posts": [
+    {
+      "id": 201,
+      "title": "Learning Drizzle",
+      "comments": [
+        { "id": 301, "content": "Great post!" }
+      ]
+    }
+  ]
+}
+```
+
+### Fetch a list without pagination
+
+```typescript
+const users = await userRepo.searchMany({
+  order: { createdAt: "desc" }
+}, "admin");
+```
+
+### Paginated search with `searchPage`
+
+```typescript
+const page = await userRepo.searchPage({
+  page: 1,
+  pageSize: 10,
+  filter: { "posts.comments.content": { $notIsNull: true } },
+  order: { createdAt: "desc" }
+}, "public");
+```
+
+## searchPage response shape
+
+`searchPage` wraps the results in a `meta` envelope:
+
+```typescript
+{
+  data: DbQueryResult<TEntity, Q>[];
+  meta: {
+    currentPage: number;
+    pageSize: number;
+    totalPages: number;
+    totalItems: number;
+  }
+}
+```
+
+<ResponseField name="data" type="object[]">
+  Array of hydrated entity objects shaped by the `projection` field (or the full entity type if projection is omitted).
+</ResponseField>
+
+<ResponseField name="meta" type="object">
+  Pagination metadata.
+
+  <Expandable title="meta properties">
+    <ResponseField name="currentPage" type="number">
+      The 1-indexed page that was returned.
+    </ResponseField>
+    <ResponseField name="pageSize" type="number">
+      The number of records per page as requested.
+    </ResponseField>
+    <ResponseField name="totalPages" type="number">
+      Total number of pages available given `totalItems` and `pageSize`.
+    </ResponseField>
+    <ResponseField name="totalItems" type="number">
+      Total count of records matching the filter across all pages.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Pagination internals
+
+To avoid Cartesian fan-out when joining one-to-many relationships, `searchPage` uses a CTE split-query strategy:
+
+1. **CTE query** — fetches exactly the requested page of base entity IDs using filters, grouping, and `LIMIT`/`OFFSET`.
+2. **Main query** — `INNER JOIN`s against the CTE result to hydrate the full relational graph for only those IDs.
+
+This guarantees that `pageSize: 10` returns exactly 10 top-level entities, regardless of how many related rows each entity has.
+
+## RBAC interaction
+
+The RBAC engine trims the `SearchQuery` before it reaches the AST compiler:
+
+- **`allowedProjections`** — unauthorized paths are removed from `projection`.
+- **`allowedFilters`** — unauthorized paths are removed from `filter` (recursively, including inside `$and`/`$or`/`$not`).
+- **`allowedSorts`** — unauthorized paths are removed from `order`.
+
+If all paths in a clause are trimmed and the resulting clause is empty, an `AccessDeniedError` is thrown.

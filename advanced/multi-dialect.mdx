@@ -1,0 +1,287 @@
+---
+title: "Multi-Dialect Support: PostgreSQL, MySQL, SQLite"
+description: "How Drizzle Castor auto-detects your database dialect and adapts mutation strategies, JSON path handling, and transaction safety for each engine."
+---
+
+Drizzle Castor is built to work identically across PostgreSQL, MySQL, and SQLite without any configuration changes. The library detects which database engine you are running at runtime through a duck-typing probe on the Drizzle instance, then automatically selects the correct SQL generation strategy for mutations, JSON operations, and transaction safety. This page explains how that detection works, how each dialect handles atomic mutations, and how JSON paths differ across engines.
+
+## Dialect detection
+
+The `getDialect()` function in `src/helper/dialect-helper.ts` never reads a config string or environment variable. Instead it probes two behavioral characteristics of the Drizzle dialect object — the parameter placeholder style and the identifier quoting style — to determine which engine is in use:
+
+```typescript
+export function getDialect(db: any): Dialect {
+  const dialect = db?.dialect;
+  if (!dialect) return "sqlite";
+
+  // 1. Check for PostgreSQL characteristics (uses $1 style parameters)
+  if (typeof dialect.escapeParam === 'function') {
+    const param = dialect.escapeParam(0, null);
+    if (typeof param === 'string' && param.startsWith('$')) {
+      return "pg";
+    }
+  }
+
+  // 2. Check for MySQL characteristics (uses backticks for escaping names)
+  if (typeof dialect.escapeName === 'function') {
+    const escaped = dialect.escapeName('a');
+    if (escaped === '`a`') {
+      return "mysql";
+    }
+  }
+
+  // 3. Fallback to SQLite (uses double quotes for escaping names like PG, but ? for params)
+  return "sqlite";
+}
+```
+
+<Note>
+  The `supportsReturning(db)` helper is a thin wrapper over `getDialect()` that returns `true` for PostgreSQL and SQLite and `false` for MySQL. All mutation executors call this before choosing a strategy.
+</Note>
+
+## Mutation strategies
+
+Different SQL engines expose different capabilities for returning the rows affected by an `UPDATE` or `DELETE`. Drizzle Castor bridges this gap with two strategies.
+
+<Tabs>
+  <Tab title="PostgreSQL">
+
+### Strategy A: RETURNING clause
+
+PostgreSQL's `RETURNING` clause lets an `UPDATE` or `DELETE` statement return the affected rows atomically within the same statement. Drizzle Castor uses this to avoid a second `SELECT` to identify which rows changed.
+
+```sql
+BEGIN;
+
+-- The mutation happens and immediately returns the ID
+UPDATE "users"
+SET "status" = 'active'
+WHERE "age" > 18
+RETURNING "id";
+
+-- If relation hydration is requested, fetch the full tree
+SELECT "users"."id", "profiles"."bio"
+FROM "users"
+LEFT JOIN "profiles" ON "users"."id" = "profiles"."user_id"
+WHERE "users"."id" = $1;
+
+COMMIT;
+```
+
+**Driver package:** `pg` (node-postgres) or `postgres` (postgres.js)
+
+  </Tab>
+  <Tab title="MySQL">
+
+### Strategy B: Temporary table fallback
+
+MySQL does not support `RETURNING` on `UPDATE` or `DELETE`. To prevent race conditions in concurrent batch mutations, Drizzle Castor uses a five-step temporary table strategy inside a transaction:
+
+<Steps>
+  <Step title="Create a temporary table">
+    An ephemeral `TEMPORARY TABLE` is created within the transaction. It holds only the primary key column so its footprint is minimal.
+
+    ```sql
+    START TRANSACTION;
+    CREATE TEMPORARY TABLE _tmp_castor_abc123 AS
+      SELECT id FROM users WHERE 1=0;
+    ```
+  </Step>
+  <Step title="Snapshot target IDs">
+    The IDs of every row that *will* be mutated are captured before the mutation runs. This snapshot is immune to concurrent writes that might change which rows match the filter.
+
+    ```sql
+    INSERT INTO _tmp_castor_abc123 (id)
+    SELECT users.id FROM users
+    WHERE users.age > 18;
+    ```
+  </Step>
+  <Step title="Execute the mutation">
+    The actual `UPDATE` or `DELETE` runs against only the snapshotted IDs using an `EXISTS` subquery, so no new rows can slip into the affected set.
+
+    ```sql
+    UPDATE users SET status = 'active'
+    WHERE EXISTS (
+      SELECT 1 FROM _tmp_castor_abc123
+      WHERE _tmp_castor_abc123.id = users.id
+    );
+    ```
+  </Step>
+  <Step title="Re-hydrate results">
+    The temporary table is used as a join target to fetch the updated rows along with any requested relations.
+
+    ```sql
+    SELECT users.id, profiles.bio
+    FROM users
+    LEFT JOIN profiles ON users.id = profiles.user_id
+    INNER JOIN _tmp_castor_abc123 sq ON users.id = sq.id;
+    ```
+  </Step>
+  <Step title="Drop the temporary table">
+    The temporary table is dropped automatically when the transaction closes, but Drizzle Castor issues an explicit `DROP` for clarity.
+
+    ```sql
+    DROP TEMPORARY TABLE IF EXISTS _tmp_castor_abc123;
+    COMMIT;
+    ```
+  </Step>
+</Steps>
+
+**Driver package:** `mysql2`
+
+  </Tab>
+  <Tab title="SQLite">
+
+### Strategy A: RETURNING clause
+
+Modern SQLite (3.35+) supports the `RETURNING` clause in the same way PostgreSQL does. Drizzle Castor treats SQLite and PostgreSQL identically for mutation purposes.
+
+```sql
+BEGIN;
+
+-- The mutation happens and immediately returns the ID
+UPDATE "users"
+SET "status" = 'active'
+WHERE "age" > 18
+RETURNING "id";
+
+-- If relation hydration is requested, fetch the full tree
+SELECT "users"."id", "profiles"."bio"
+FROM "users"
+LEFT JOIN "profiles" ON "users"."id" = "profiles"."user_id"
+WHERE "users"."id" = ?;
+
+COMMIT;
+```
+
+**Driver package:** `better-sqlite3` (via `drizzle-orm/bun-sqlite` for Bun)
+
+  </Tab>
+</Tabs>
+
+## JSON path handling
+
+JSON columns require dialect-specific SQL operators for both reading (extraction) and writing (mutation). Drizzle Castor normalizes these differences so you always write the same dot-notation path in your queries.
+
+### Extraction — reading nested values
+
+When a projection or filter references a nested JSON path such as `"settings.theme"`, the `buildJsonExtractionSql` function converts it to the correct dialect syntax:
+
+<Tabs>
+  <Tab title="PostgreSQL">
+
+PostgreSQL uses the `#>>` operator to extract a nested value as unquoted text. The dot-notation path `settings.theme` becomes a brace-delimited array literal:
+
+```sql
+-- Projection: "settings.theme"
+"settings"#>>'{theme}'
+
+-- Projection: "metadata.address.city"
+"metadata"#>>'{address,city}'
+```
+
+  </Tab>
+  <Tab title="MySQL">
+
+MySQL uses the `->>` operator with a `$` dot-notation JSONPath expression:
+
+```sql
+-- Projection: "settings.theme"
+`settings`->>'$.theme'
+
+-- Projection: "metadata.address.city"
+`metadata`->>'$.address.city'
+```
+
+  </Tab>
+  <Tab title="SQLite">
+
+SQLite uses the `json_extract()` function with a `$` dot-notation path:
+
+```sql
+-- Projection: "settings.theme"
+json_extract("settings", '$.theme')
+
+-- Projection: "metadata.address.city"
+json_extract("metadata", '$.address.city')
+```
+
+  </Tab>
+</Tabs>
+
+### Mutation — updating nested values
+
+When an `updateOne` or `updateMany` set payload uses a dot-notation key such as `"settings.theme": "light"`, the `parseUpdateSet` function generates the correct dialect-specific merge:
+
+<Tabs>
+  <Tab title="PostgreSQL">
+
+PostgreSQL uses `jsonb_set()` combined with `COALESCE` to merge the new value into the existing JSON object without overwriting sibling keys:
+
+```sql
+SET "settings" = jsonb_set(
+  COALESCE("settings", '{}'),
+  '{theme}',
+  '"light"'
+)
+```
+
+  </Tab>
+  <Tab title="MySQL">
+
+MySQL uses `JSON_SET()` with a `CAST` to preserve the JSON type of object values:
+
+```sql
+SET `settings` = JSON_SET(
+  `settings`,
+  '$.theme',
+  CAST('"light"' AS JSON)
+)
+```
+
+  </Tab>
+  <Tab title="SQLite">
+
+SQLite uses `json_set()` with the `json()` function to handle object-typed values:
+
+```sql
+SET "settings" = json_set(
+  "settings",
+  '$.theme',
+  json('"light"')
+)
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+  All JSON paths are validated by `validateJsonPath()` before they reach the SQL generator. The validator restricts path strings to alphanumerics, dots, and array indices, preventing SQL injection and prototype pollution regardless of dialect.
+</Tip>
+
+## Driver packages
+
+Each dialect requires a specific database driver alongside Drizzle ORM. Drizzle Castor does not bundle any drivers.
+
+<CardGroup cols={3}>
+  <Card title="PostgreSQL" icon="database" href="/concepts/schema-builder">
+    Install `pg` or `postgres`. Pass the Drizzle instance created with `drizzle-orm/node-postgres` or `drizzle-orm/postgres-js`.
+  </Card>
+  <Card title="MySQL" icon="database" href="/concepts/schema-builder">
+    Install `mysql2`. Pass the Drizzle instance created with `drizzle-orm/mysql2`.
+  </Card>
+  <Card title="SQLite" icon="database" href="/concepts/schema-builder">
+    Install `better-sqlite3`. Pass the Drizzle instance created with `drizzle-orm/better-sqlite3` or `drizzle-orm/bun-sqlite`.
+  </Card>
+</CardGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Safe pagination with CTE split queries" icon="list" href="/advanced/pagination">
+    See how the CTE split query strategy handles `LIMIT`/`OFFSET` correctly across dialects.
+  </Card>
+  <Card title="Type system and inference" icon="code" href="/advanced/type-system">
+    Explore how TypeScript generics enforce type safety end-to-end regardless of which dialect you use.
+  </Card>
+</CardGroup>

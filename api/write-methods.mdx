@@ -1,0 +1,264 @@
+---
+title: "Repository Write Methods: create and update records"
+description: "Complete reference for drizzle-castor's typed write methods: createOne, createMany, updateOne, updateMany, and factory helpers for insert and update objects."
+---
+
+The write methods on a `Repository` instance handle all insertion and mutation operations against the underlying table. Every method runs through the RBAC middleware before reaching Drizzle ORM, so the `profile` argument is used to enforce `allowedSets` and `allowedActions` policies. The `UpdateSet` type used by the update methods supports dot-notation paths, which means you can perform partial updates on individual JSON column properties without overwriting the entire column value.
+
+---
+
+## createOne
+
+Inserts a single record and returns the full created entity, including any server-generated defaults such as primary keys and timestamps.
+
+**Signature**
+
+```typescript
+createOne(
+  data: TInsert,
+  profile?: string | string[],
+): Promise<TEntity>
+```
+
+### Parameters
+
+<ParamField path="data" type="TInsert" required>
+  The insert payload inferred from the Drizzle table definition. The shape is identical to what you would pass to `db.insert(table).values(...)` directly. Required columns must be provided; optional columns may be omitted.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  The RBAC profile (or profiles) to evaluate. Fields listed in `allowedSets` for the active profile are the only fields permitted to be written. Any field not in `allowedSets` is silently stripped from the payload before the insert executes. Defaults to `"default"` when omitted.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="TEntity">
+  The complete entity as it exists in the database after the insert, including generated values.
+</ResponseField>
+
+### Example
+
+```typescript
+const newUser = await userRepo.createOne(
+  {
+    name: "Jane Doe",
+    email: "jane@example.com",
+  },
+  "admin",
+);
+
+// newUser → { id: 42, name: "Jane Doe", email: "jane@example.com", createdAt: "..." }
+```
+
+---
+
+## createMany
+
+Inserts multiple records in a single operation and returns all created entities as an array. The order of the returned array matches the order of the input array.
+
+**Signature**
+
+```typescript
+createMany(
+  data: TInsert[],
+  profile?: string | string[],
+): Promise<TEntity[]>
+```
+
+### Parameters
+
+<ParamField path="data" type="TInsert[]" required>
+  An array of insert payloads. Each element follows the same rules as the `data` parameter in `createOne`. An empty array is a no-op and returns an empty array.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. The `allowedSets` policy is applied to every element in the array.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="TEntity[]">
+  An array of fully-hydrated entities in insertion order.
+</ResponseField>
+
+### Example
+
+```typescript
+const newUsers = await userRepo.createMany(
+  [
+    { name: "Alice", email: "alice@example.com" },
+    { name: "Bob", email: "bob@example.com" },
+  ],
+  "admin",
+);
+
+// newUsers → [{ id: 43, name: "Alice", ... }, { id: 44, name: "Bob", ... }]
+```
+
+---
+
+## updateOne
+
+Updates a single record identified by its primary key value and returns the updated entity. Returns `null` if no record with the given `id` exists among the currently active (non-deleted) rows.
+
+**Signature**
+
+```typescript
+updateOne(
+  id: string | number,
+  set: UpdateSet<NonNullable<TInsert>>,
+  profile?: string | string[],
+): Promise<TEntity | null>
+```
+
+### Parameters
+
+<ParamField path="id" type="string | number" required>
+  The primary key value of the record to update. The method automatically identifies the correct primary key column from the table definition.
+</ParamField>
+
+<ParamField path="set" type="UpdateSet&lt;NonNullable&lt;TInsert&gt;&gt;" required>
+  The fields to update. `UpdateSet` is a mapped type over all valid dot-notation paths of the insert type, so top-level columns and nested JSON paths are both supported. Only the keys present in the object are written; all other fields are left unchanged.
+
+  <Expandable title="UpdateSet details">
+    `UpdateSet<T>` is defined as:
+
+    ```typescript
+    type UpdateSet<T> = {
+      [K in ValidPath<T>]?: ValueAt<T, K>;
+    };
+    ```
+
+    This means you can supply:
+    - A top-level column: `{ name: "John Updated" }`
+    - A nested JSON path: `{ "settings.theme": "light" }`
+    - Multiple paths at once: `{ name: "John", "settings.theme": "dark" }`
+
+    The library merges JSON sub-paths into the existing column value rather than replacing the entire object.
+  </Expandable>
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. Fields not in `allowedSets` are stripped before the SQL `UPDATE` is built.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="TEntity | null">
+  The fully-hydrated entity after the update, or `null` if no active record with the given `id` was found.
+</ResponseField>
+
+### Example
+
+```typescript
+// Update a top-level column
+const updated = await userRepo.updateOne(
+  1,
+  { name: "John Updated" },
+  "admin",
+);
+
+// Partially update a JSON column using dot-notation
+const themeUpdated = await userRepo.updateOne(
+  1,
+  { "settings.theme": "light" },
+  "admin",
+);
+
+// updated → { id: 1, name: "John Updated", settings: { theme: "light" }, ... }
+```
+
+<Tip>
+  Dot-notation paths in `set` perform a **partial** JSON column update. Providing `"settings.theme": "light"` merges only the `theme` key into the `settings` column without touching any other keys in that JSON object.
+</Tip>
+
+---
+
+## updateMany
+
+Updates all active records matching a filter condition and returns every updated entity as an array. This is useful for bulk operations such as disabling features for a segment of users.
+
+**Signature**
+
+```typescript
+updateMany(
+  filter: FilterQuery<TEntity>,
+  set: UpdateSet<NonNullable<TInsert>>,
+  profile?: string | string[],
+): Promise<TEntity[]>
+```
+
+### Parameters
+
+<ParamField path="filter" type="FilterQuery&lt;TEntity&gt;" required>
+  The WHERE condition expressed as a structured filter object. Supports the same operator keys (`$eq`, `$lt`, `$or`, `$and`, etc.) and dot-notation paths as the `filter` field in read methods. Only active (non-soft-deleted) records are considered.
+</ParamField>
+
+<ParamField path="set" type="UpdateSet&lt;NonNullable&lt;TInsert&gt;&gt;" required>
+  The fields to update on every matched record. Same dot-notation rules as `updateOne`.
+</ParamField>
+
+<ParamField path="profile" type="string | string[]">
+  RBAC profile(s) to evaluate. Both `allowedFilters` and `allowedSets` policies apply.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="TEntity[]">
+  An array of all updated entities in their post-update state. Returns an empty array if no records matched the filter.
+</ResponseField>
+
+### Example
+
+```typescript
+// Disable notifications for all minors
+const batchUpdated = await userRepo.updateMany(
+  { age: { $lt: 18 } },
+  { "settings.notifications": false },
+  "admin",
+);
+
+// batchUpdated → [{ id: 5, settings: { notifications: false }, ... }, ...]
+```
+
+---
+
+## Factory helpers
+
+These methods are pure type-narrowing utilities. They perform no database operation and exist solely to give TypeScript the information it needs to infer the correct types when building insert or update objects in isolation.
+
+### defineInsertValue
+
+```typescript
+defineInsertValue: (data: TInsert) => TInsert
+```
+
+Validates and returns a full insert payload. Useful for constructing typed insert templates outside of a `createOne` / `createMany` call.
+
+```typescript
+const userTemplate = userRepo.defineInsertValue({
+  name: "Template User",
+  email: "template@example.com",
+});
+
+const created = await userRepo.createOne(userTemplate, "admin");
+```
+
+### defineUpdateSet
+
+```typescript
+defineUpdateSet: (set: UpdateSet<NonNullable<TInsert>>) => UpdateSet<NonNullable<TInsert>>
+```
+
+Validates and returns an `UpdateSet` object. Use this to define reusable update presets with full autocomplete on the dot-notation paths.
+
+```typescript
+const defaultSettings = userRepo.defineUpdateSet({
+  "settings.theme": "light",
+  "settings.notifications": true,
+});
+
+// Apply the same preset to multiple records
+await userRepo.updateOne(1, defaultSettings, "admin");
+await userRepo.updateOne(2, defaultSettings, "admin");
+```

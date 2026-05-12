@@ -1,81 +1,331 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: 'Get started with Drizzle Castor in five minutes'
+description: 'Install Drizzle Castor, define your schema, configure access control, and run your first type-safe createOne, searchMany, and searchPage queries.'
 ---
 
-## Get started in three steps
+This guide walks you through every step required to go from a blank project to executing type-safe database queries with Drizzle Castor. You will install the package, write a Drizzle schema, configure the schema builder with profiles and policies, define table relations, and run your first queries — all with full TypeScript inference.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
 
-### Step 1: Set up your local environment
+<Step title="Install the package">
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+Add Drizzle Castor and its required peer dependency to your project. Drizzle ORM is required because Drizzle Castor builds directly on top of it.
 
-### Step 2: Deploy your changes
+<CodeGroup>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash bun
+bun add @fajarnugraha37/drizzle-castor drizzle-orm
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash npm
+npm install @fajarnugraha37/drizzle-castor drizzle-orm
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash pnpm
+pnpm add @fajarnugraha37/drizzle-castor drizzle-orm
+```
 
-### Step 3: Go live
+```bash yarn
+yarn add @fajarnugraha37/drizzle-castor drizzle-orm
+```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+</CodeGroup>
 
-## Next steps
+<Tip>
+  If you prefer ESM-first or Deno environments, you can also install from JSR. See the [installation page](/installation) for JSR commands.
+</Tip>
 
-Now that you have your docs running, explore these key features:
+</Step>
 
-<CardGroup cols={2}>
+<Step title="Set up your Drizzle schema">
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+Create your standard Drizzle ORM schema. Drizzle Castor reads column types and references directly from this schema to provide full type inference throughout your application — you do not need to change anything here.
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+```typescript schema.ts
+import { int, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+export const usersTable = sqliteTable("users", {
+  id: int("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  email: text("email").unique().notNull(),
+  age: int("age"),
+  tags: text({ mode: 'json' }).$type<string[]>(),
+  persona: text({ mode: 'json' }).$type<{ hobbies: string[]; skills: string[] }>(),
+  settings: text({ mode: 'json' }).$type<{ 
+    theme: string; 
+    notifications: boolean;
+  }>(),
+  companyId: int("company_id").references(() => companiesTable.id),
+  createdAt: int("created_at").$default(() => Date.now()),
+  updatedAt: int("updated_at").$default(() => Date.now()).$onUpdate(() => Date.now()),
+  deletedFlag: int("deleted_flag").default(0),
+  deletedAt: int("deleted_at"),
+});
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+export const postsTable = sqliteTable("posts", {
+  id: int("id").primaryKey({ autoIncrement: true }),
+  title: text("title").notNull(),
+  userId: int("userId").references(() => usersTable.id),
+  createdAt: int("created_at").$default(() => Date.now()),
+  deletedFlag: int("deleted_flag").default(0),
+});
 
-</CardGroup>
+export const profilesTable = sqliteTable("profiles", {
+  id: int("id").primaryKey({ autoIncrement: true }),
+  bio: text("bio"),
+  avatarUrl: text("avatar_url"),
+  userId: int("user_id").references(() => usersTable.id),
+});
+
+export const companiesTable = sqliteTable("companies", {
+  id: int("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+});
+```
+
+</Step>
+
+<Step title="Initialize SchemaBuilder with createSchemaBuilder">
+
+Import `createSchemaBuilder` and pass your Drizzle database instance together with your table definitions. The third argument sets the execution mode.
+
+```typescript db.ts
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import { usersTable, postsTable, profilesTable } from "./schema";
+
+const db = drizzle("sqlite.db");
+
+export const schemaMetadataBuilder = createSchemaBuilder(db, [
+  usersTable,
+  postsTable,
+  profilesTable
+] as const, "lenient");
+```
+
+<Info>
+  The execution mode controls how Drizzle Castor handles tables without an explicit policy:
+
+  - **`lenient`** (default) — tables without a policy allow all actions.
+  - **`strict`** — every table must have an explicit policy or an `AccessDeniedError` is thrown.
+</Info>
+
+</Step>
+
+<Step title="Configure profiles and logger">
+
+Chain `.profiles()` to register the valid role names your application uses, and `.withLogger()` to enable the built-in hybrid logger. TypeScript uses the profile list to give you autocomplete and type-checking when you pass a profile to a repository method.
+
+```typescript db.ts
+export const schemaMetadataBuilder = createSchemaBuilder(db, [
+  usersTable,
+  postsTable,
+  profilesTable
+] as const, "lenient")
+  .profiles(['default', 'public', 'admin', 'user'] as const)
+  .withLogger({ 
+    level: 'INFO', 
+    format: '%d{HH:mm:ss} %p [%c] (%t) %s'
+  });
+```
+
+</Step>
+
+<Step title="Define table relations">
+
+Use `.table()` to declare relationships between your Drizzle tables. Drizzle Castor uses these declarations to build the `JOIN` clauses needed when you use dot-notation paths such as `"posts.title"` in projections or filters. You can also enable soft-delete behaviour here.
+
+```typescript db.ts
+schemaMetadataBuilder.table("users", {
+  oneToOne: [
+    {
+      relationName: "profile",
+      relatedTable: "profiles",
+      localKey: "users.id",
+      foreignKey: "profiles.userId",
+    }
+  ],
+  oneToMany: [
+    {
+      relationName: "posts",
+      relatedTable: "posts",
+      localKey: "users.id",
+      foreignKey: "posts.userId",
+    },
+  ],
+  softDelete: {
+    deleteValue: { deletedFlag: 1 },
+    restoreValue: { deletedFlag: 0 },
+  },
+});
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  Relations are defined separately from your physical Drizzle schema. You do not need to modify your `sqliteTable` (or `pgTable` / `mysqlTable`) definitions.
 </Note>
+
+</Step>
+
+<Step title="Set up policies">
+
+Define who can do what on each table using `.policies()`. Policies can be static objects for simple cases or asynchronous functions that resolve rules dynamically from the execution context.
+
+```typescript db.ts
+// Global fallback policy — applies to all tables not otherwise specified
+schemaMetadataBuilder.policies((ctx, tableName, profiles) => {
+  if (profiles.includes("admin")) return { allowedActions: "*" };
+  return { allowedActions: ["read"] };
+});
+
+// Table-specific policies
+schemaMetadataBuilder.policies('users', {
+  // Static policy — read-only with field restrictions
+  public: { 
+    allowedActions: ["read"],
+    allowedFilters: ["name", "email", "settings.theme"],
+    allowedProjections: ["name", "profile.bio"],
+  },
+
+  // Static wildcard — full access
+  admin: {
+    allowedActions: "*",
+    allowedSets: "*",
+    allowedProjections: "*",
+    allowedFilters: "*",
+    allowedSorts: "*"
+  },
+
+  // Dynamic policy — resolved per request
+  user: async (ctx) => {
+    const isOwner = ctx.params.id === ctx.state.userId;
+    return {
+      allowedActions: isOwner ? ["read", "update"] : ["read"],
+      allowedSets: ["settings.theme", "persona.skills"],
+      allowedProjections: ["*"],
+      allowedFilters: "*",
+      allowedSorts: "*"
+    };
+  }
+});
+```
+
+<Tip>
+  Available actions are `"create"`, `"read"`, `"update"`, `"softDelete"`, `"restore"`, and `"hardDelete"`. Use `"*"` to grant all of them at once.
+</Tip>
+
+</Step>
+
+<Step title="Build and create a repository with repoFactory">
+
+Call `.build()` to finalise the configuration and then use `repoFactory()` to create a typed repository for a specific table. The returned object provides all CRUD methods with full TypeScript inference.
+
+```typescript db.ts
+// Finalise configuration
+export const schemaMetadata = schemaMetadataBuilder.build();
+
+// Create a typed repository for the "users" table
+const userRepo = schemaMetadata.repoFactory("users");
+```
+
+</Step>
+
+<Step title="Run your first createOne, searchMany, and searchPage queries">
+
+Every repository method accepts a profile string as its last argument. The RBAC engine validates the profile and applies field-level trimming before the query reaches the database.
+
+```typescript queries.ts
+// Create a single record
+const newUser = await userRepo.createOne({
+  name: "Jane Doe",
+  email: "jane@example.com"
+}, "admin");
+
+// Fetch multiple records with filtering and ordering
+const users = await userRepo.searchMany({
+  order: { createdAt: "desc" }
+}, "admin");
+
+// Fetch a single record with deep relations and JSON extraction
+const user = await userRepo.searchOne({
+  projection: [
+    "name", 
+    "profile.bio",            // 1:1 relation
+    "posts.title",            // 1:N relation
+    "settings.theme",         // JSON object extraction
+    "persona.skills.0"        // JSON array index extraction
+  ], 
+  filter: {
+    $or: [
+      { name: { $like: "%Jane%" } },
+      { "settings.theme": { $eq: "dark" } }
+    ]
+  },
+  order: {
+    "createdAt": "desc"
+  }
+}, "admin");
+
+// Paginate results
+const page = await userRepo.searchPage({
+  page: 1,
+  pageSize: 10,
+  filter: { "posts.title": { $notIsNull: true } }
+}, "public");
+// Returns:
+// { 
+//   data: [{ id: 1, name: "Jane", posts: [...] }, ...], 
+//   meta: { currentPage: 1, pageSize: 10, totalPages: 5, totalItems: 42 } 
+// }
+```
+
+<Info>
+  Unlike raw SQL, `searchOne` and `searchMany` automatically hydrate flat rows into clean, nested JavaScript objects that mirror your query shape. See [JSON querying](/concepts/json-querying) for the full filter operator reference.
+</Info>
+
+</Step>
+
+<Step title="Subscribe to telemetry events">
+
+Before calling `.build()`, register event listeners on the builder to capture non-blocking telemetry. The `execution` event fires after every repository method completes; the `security` event fires when an access control decision is made.
+
+```typescript db.ts
+schemaMetadataBuilder.on('execution', (ev) => {
+  // ev contains: action, tableName, duration, status, traceId
+  console.log(`${ev.action} on ${ev.tableName} took ${ev.duration}ms`);
+});
+
+schemaMetadataBuilder.on('security', (ev) => {
+  console.warn(`[Audit] Security event on ${ev.tableName}: ${ev.message}`);
+});
+```
+
+<Tip>
+  You can also register Koa-style middlewares with `.use()` for full lifecycle control over every repository call. See [middleware pipeline](/middleware/pipeline) for details.
+</Tip>
+
+</Step>
+
+</Steps>
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="JSON querying" icon="filter" href="/concepts/json-querying">
+    Explore every filter operator, projection path, and sort key supported by the AST translator.
+  </Card>
+  <Card title="Access control" icon="lock" href="/access-control/overview">
+    Deep dive into profiles, policies, and intelligent data trimming.
+  </Card>
+  <Card title="Relations" icon="link" href="/concepts/relations">
+    Learn how to define one-to-one, one-to-many, and many-to-many relationships.
+  </Card>
+  <Card title="Middleware pipeline" icon="layers" href="/middleware/pipeline">
+    Compose custom middlewares and understand the execution context.
+  </Card>
+  <Card title="Telemetry" icon="chart-bar" href="/middleware/telemetry">
+    Reference for all telemetry events and their payload shapes.
+  </Card>
+  <Card title="Soft deletes" icon="trash" href="/advanced/soft-deletes">
+    Configure declarative soft deletes and the restore workflow.
+  </Card>
+</CardGroup>

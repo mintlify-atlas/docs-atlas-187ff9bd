@@ -1,0 +1,231 @@
+---
+title: "Pattern-Based Structured Logging in Drizzle Castor"
+description: "Configure pino-powered logging via builder.withLogger(). Use Quarkus-style tokens like %d, %p, %t, and %{key.path} to inject context into every log line."
+---
+
+Drizzle Castor's built-in logger wraps [pino](https://getpino.io/) with a `PatternFormatter` that supports Quarkus-style format tokens. Every log entry is automatically enriched with the `traceId` from the current `ExecutionContext`, so log lines from concurrent requests stay correctly attributed even in high-throughput environments. You configure logging once on the schema builder and it applies uniformly to all repository operations.
+
+## Enabling the logger
+
+Call `builder.withLogger({ level, format })` before calling `.build()`. Both fields are optional; omitting `level` defaults to `WARN` and omitting `format` falls back to the library default format string.
+
+```typescript
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const, "lenient")
+  .profiles(["admin", "user", "public"] as const)
+  .withLogger({
+    level: "INFO",
+    format: "%d{HH:mm:ss} %p [%c] (%t) %s",
+  });
+```
+
+## Log levels
+
+<Tabs>
+  <Tab title="TRACE">
+    Captures the most granular internal detail: query parsing steps, alias resolution, individual middleware dispatch calls. Use only during local debugging — extremely verbose.
+
+    ```typescript
+    builder.withLogger({ level: "TRACE", format: "%d{HH:mm:ss} %-5p [%c] (%t) %s" });
+    ```
+  </Tab>
+
+  <Tab title="DEBUG">
+    Logs internal decisions such as dialect detection, soft-delete injection, and RBAC field trimming. Suitable for development environments.
+
+    ```typescript
+    builder.withLogger({ level: "DEBUG", format: "%d{HH:mm:ss} %-5p [%c] (%t) %s" });
+    ```
+  </Tab>
+
+  <Tab title="INFO">
+    Logs normal operation milestones: operation start, completion, and table name. A good default for staging environments.
+
+    ```typescript
+    builder.withLogger({ level: "INFO", format: "%d{yyyy-MM-dd HH:mm:ss} %p [%c] (%t) %s" });
+    ```
+  </Tab>
+
+  <Tab title="WARN">
+    Logs unexpected but recoverable conditions: policy mismatches, unknown fields, fallback paths. This is the **default** level when `withLogger` is not called.
+
+    ```typescript
+    builder.withLogger({ level: "WARN", format: "%d{yyyy-MM-dd HH:mm:ss} %p [%c] (%t) %s" });
+    ```
+  </Tab>
+
+  <Tab title="ERROR / FATAL">
+    Logs unhandled exceptions and fatal pipeline failures. Use in production together with a centralized log aggregator.
+
+    ```typescript
+    builder.withLogger({ level: "ERROR", format: "%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c] (%t) %s%e%n" });
+    ```
+  </Tab>
+
+  <Tab title="OFF">
+    Disables all logging output entirely. The logger instance still exists but no `process.stdout.write` calls are made.
+
+    ```typescript
+    builder.withLogger({ level: "OFF" });
+    ```
+  </Tab>
+</Tabs>
+
+## Format string tokens
+
+The `format` string is interpreted by the `PatternFormatter` class in `src/helper/logger-helper.ts`. Tokens are substituted at runtime for each log entry.
+
+| Token | Description | Example output |
+|---|---|---|
+| `%d{format}` | Current datetime using the given format string | `%d{HH:mm:ss}` → `14:32:07` |
+| `%p` | Log level in uppercase | `INFO`, `WARN`, `ERROR` |
+| `%-5p` | Log level left-padded to 5 characters | `INFO `, `WARN `, `ERROR` |
+| `%c` | Logger category (always `castor.core` for the built-in logger) | `castor.core` |
+| `%i` | Current process PID | `12345` |
+| `%t` | Trace ID from the current `ExecutionContext` | `3f2a1b9c-…` |
+| `%z` | System timezone | `Asia/Jakarta` |
+| `%s` | The log message string | `Executing read on users` |
+| `%e` | Error stack trace (empty string when no error) | `Error: …\n  at …` |
+| `%n` | Newline character | (line break) |
+| `%{key.path}` | Context injection — dot-notation path into the `ExecutionContext` | `%{params.filter}` |
+
+### Datetime format specifiers
+
+The `%d{format}` token supports the following sub-tokens inside the braces:
+
+| Sub-token | Value |
+|---|---|
+| `yyyy` | Four-digit year |
+| `MM` | Two-digit month (01–12) |
+| `dd` | Two-digit day (01–31) |
+| `HH` | Two-digit hour, 24-hour clock (00–23) |
+| `mm` | Two-digit minute (00–59) |
+| `ss` | Two-digit second (00–59) |
+| `SSS` | Three-digit milliseconds (000–999) |
+
+## Context injection with `%{key.path}`
+
+The `%{key.path}` token extracts any value from the `ExecutionContext` at log time using dot-notation. Array indices are also supported via bracket notation (e.g., `params.projection[0]`).
+
+```typescript
+// Format string using context injection
+builder.withLogger({
+  level: "DEBUG",
+  format: "%d{HH:mm:ss} %p [%c] (%t) action=%{action} table=%{tableName} profile=%{profile} %s",
+});
+
+// A DEBUG log line for a read operation would produce:
+// 14:32:07 DEBUG [castor.core] (3f2a1b9c-…) action=read table=users profile=admin Executing searchMany
+```
+
+<AccordionGroup>
+  <Accordion title="Extracting nested params">
+    Access nested fields inside `ctx.params` — for example, the first element of the projection array:
+
+    ```typescript
+    builder.withLogger({
+      level: "TRACE",
+      format: "%d{HH:mm:ss} %p [%c] (%t) first_projection=%{params.query.projection[0]} %s",
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="Injecting state values set by middleware">
+    If a middleware writes to `ctx.state.tenantId`, you can surface it in every log line:
+
+    ```typescript
+    builder.withLogger({
+      level: "INFO",
+      format: "%d{HH:mm:ss} %p [%c] tenant=%{state.tenantId} (%t) %s",
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="Fallback for missing paths">
+    If the dot-notation path does not resolve to a value (because the key is absent or the context is not available), the token is replaced with an empty string — no exception is thrown.
+  </Accordion>
+</AccordionGroup>
+
+## How the logger integrates with pino
+
+Drizzle Castor creates a `CastorLogger` instance that wraps pino internally (`src/helper/logger-helper.ts`). Pino handles log-level filtering — if the configured level is `INFO`, pino's `isLevelEnabled` check skips the formatting step entirely for `DEBUG` and `TRACE` calls, keeping the hot path cost close to zero.
+
+The formatted string is written directly to `process.stdout` using `process.stdout.write`, preserving pino's zero-copy write semantics while giving you full control over the output format.
+
+```typescript
+// Internal CastorLogger method (simplified)
+private log(level: string, message: string, ...args: any[]) {
+  if (!this.pinoInstance.isLevelEnabled(level)) return;  // Fast no-op
+
+  const formatted = this.formatter.format(level, this.category, message, error);
+  process.stdout.write(formatted);  // Zero-copy write
+}
+```
+
+The global `logger` singleton (exported from `src/helper/logger-helper.ts`) uses `AsyncLocalStorage` to pull the active `ExecutionContext` at the moment of each log call — so you never need to pass a logger instance through function arguments.
+
+```typescript
+export const logger: ILogger = {
+  info: (msg, ...args) =>
+    (executionContextStorage.getStore()?.translatorContext?.logger || internalLogger)
+      .info(msg, ...args),
+  // ... same pattern for all levels
+};
+```
+
+<Info>
+  The context-aware logger is used by all internal Drizzle Castor modules. You do not need to import or call it manually; configuring it via `builder.withLogger()` is sufficient.
+</Info>
+
+## Example format strings
+
+```typescript
+// Compact development format: time + level + traceId + message
+builder.withLogger({ level: "DEBUG", format: "%d{HH:mm:ss} %p [%c] (%t) %s" });
+// Output: 14:32:07 DEBUG [castor.core] (3f2a1b9c) Executing read on users
+
+// Full production format with milliseconds, PID, and error stack
+builder.withLogger({
+  level: "WARN",
+  format: "%d{yyyy-MM-dd HH:mm:ss,SSS} %-5p [%c] (pid:%i) (%t) %s%e%n",
+});
+// Output: 2026-05-12 14:32:07,142 WARN  [castor.core] (pid:12345) (3f2a1b9c) Field 'passwordHash' trimmed by RBAC
+
+// Context-enriched format for multi-tenant debugging
+builder.withLogger({
+  level: "INFO",
+  format: "%d{HH:mm:ss} %p table=%{tableName} action=%{action} tenant=%{state.tenantId} (%t) %s",
+});
+// Output: 14:32:07 INFO table=users action=read tenant=acme-corp (3f2a1b9c) searchOne completed
+```
+
+## TraceId correlation for concurrent requests
+
+The `%t` token always resolves to `ctx.traceId` — a UUID generated at the start of each repository call and threaded through all middleware, log calls, and telemetry events for that single operation. In a server handling concurrent requests, this lets you grep your log output by `traceId` to reconstruct the exact sequence of events for a given request without any extra instrumentation.
+
+```bash
+# Filter logs for a single trace in production
+grep "3f2a1b9c-4d5e-6f7a-8b9c-0d1e2f3a4b5c" app.log
+```
+
+<Tip>
+  Combine the logger with the `execution` telemetry event for a two-layer observability strategy: the logger captures inline diagnostic detail (query structure, RBAC decisions), while events push structured metrics to your monitoring system.
+</Tip>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Middleware pipeline" icon="layer-group" href="/middleware/pipeline">
+    Add custom middleware that reads from the same ExecutionContext the logger uses.
+  </Card>
+  <Card title="Telemetry & Events" icon="chart-line" href="/middleware/telemetry">
+    Subscribe to structured events that carry the same traceId for cross-system correlation.
+  </Card>
+  <Card title="Schema builder methods" icon="wrench" href="/api/schema-builder-methods">
+    Full reference for withLogger() and all other builder configuration methods.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    See a minimal working example with logging configured alongside a repository.
+  </Card>
+</CardGroup>

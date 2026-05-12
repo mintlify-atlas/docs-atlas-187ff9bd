@@ -1,133 +1,88 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Drizzle Castor: Type-Safe CRUD & DAO for Drizzle ORM"
+description: "Drizzle Castor adds JSON-based querying, a middleware pipeline, unified RBAC, and multi-dialect support on top of Drizzle ORM. Get started in minutes."
 ---
 
-## Setting up
+Drizzle Castor is a type-safe CRUD library and Data Access Object (DAO) abstraction built on top of [Drizzle ORM](https://orm.drizzle.team/). It lets you query your database using intuitive JSON payloads, enforce access control through a built-in RBAC engine, intercept every operation via a Koa-style middleware pipeline, and run across PostgreSQL, MySQL, and SQLite without changing your application code.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install Drizzle Castor and run your first type-safe query in under five minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="download" href="/installation">
+    Install from npm or JSR across all major package managers and runtimes.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Schema Builder" icon="wrench" href="/concepts/schema-builder">
+    Learn how to configure tables, relations, middleware, and policies with the builder API.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/create-schema-builder">
+    Explore every public method, parameter type, and return value.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What Drizzle Castor provides
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="JSON-Based Querying" icon="filter">
+    Filter, sort, and project relational data with expressive JSON payloads. The AST translator compiles them to dialect-correct Drizzle SQL automatically.
+  </Card>
+  <Card title="Unified RBAC" icon="shield">
+    Enforce action-level and field-level access control at the repository layer — no scattered auth checks across your service code.
+  </Card>
+  <Card title="Middleware Pipeline" icon="layer-group">
+    Intercept every database operation with Koa-style `(ctx, next)` middleware. Add logging, tracing, caching, or multi-tenancy as composable layers.
+  </Card>
+  <Card title="Multi-Dialect Support" icon="database">
+    Works across PostgreSQL, MySQL, and SQLite. Handles dialect-specific details like `RETURNING` clauses and temporary table fallbacks transparently.
+  </Card>
+  <Card title="Soft Deletes" icon="trash-can-arrow-up">
+    Declare soft-delete behavior once on your table config. Safety filters are injected automatically into every query and join.
+  </Card>
+  <Card title="Safe Pagination" icon="table-list">
+    Paginate one-to-many relationships accurately using CTE Split Queries — no Cartesian fan-out, no off-by-one row counts.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started
 
-## Make your content agent ready
+<Steps>
+  <Step title="Install the package">
+    Add Drizzle Castor alongside Drizzle ORM to your project.
 
-Make your docs work for humans and AI agents alike.
+    ```bash
+    bun add @fajarnugraha37/drizzle-castor drizzle-orm
+    ```
+  </Step>
+  <Step title="Initialize the schema builder">
+    Pass your Drizzle database instance and table definitions to `createSchemaBuilder`.
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+    ```typescript
+    import { drizzle } from "drizzle-orm/bun-sqlite";
+    import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+    import { usersTable } from "./schema";
 
-## Need inspiration?
+    const db = drizzle("sqlite.db");
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    const builder = createSchemaBuilder(db, [usersTable] as const, "strict")
+      .profiles(["admin", "user"] as const)
+      .withLogger({ level: "INFO", format: "%d [%p] (%t) %s" });
+    ```
+  </Step>
+  <Step title="Create a repository and query">
+    Build the metadata and use `repoFactory` to get a fully typed repository.
+
+    ```typescript
+    const metadata = builder.build();
+    const userRepo = metadata.repoFactory("users");
+
+    const users = await userRepo.searchMany({
+      filter: { "name": { $like: "%John%" } },
+      order: { createdAt: "desc" }
+    }, "admin");
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Drizzle Castor requires Drizzle ORM `^0.45.2` and TypeScript `^5`. It runs on Bun 1.0+ and Node.js.
+</Note>

@@ -1,126 +1,101 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Drizzle Castor",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#242b2c",
+    "light": "#6a6a6d",
+    "dark": "#ebeaea"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/bbb21190-6987-4c67-9b0d-d149e82e27b6.png",
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/fajarnugraha37/drizzle-castor"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/fajarnugraha37/drizzle-castor"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
+              "introduction",
               "quickstart",
-              "development"
+              "installation"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Core Concepts",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "concepts/schema-builder",
+              "concepts/repositories",
+              "concepts/json-querying",
+              "concepts/relations"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Access Control",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/components",
-              "essentials/reusable-snippets"
+              "access-control/overview",
+              "access-control/policies",
+              "access-control/profiles"
             ]
           },
           {
-            "group": "Agent ready",
+            "group": "Middleware & Extensibility",
             "pages": [
-              "agent-ready/prompt",
-              "agent-ready/visibility",
-              "agent-ready/contextual",
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "middleware/pipeline",
+              "middleware/telemetry",
+              "middleware/logging"
+            ]
+          },
+          {
+            "group": "Dialects & Advanced",
+            "pages": [
+              "advanced/multi-dialect",
+              "advanced/soft-deletes",
+              "advanced/pagination",
+              "advanced/type-system"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "API Reference",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Builder API",
             "pages": [
-              "api-reference/introduction"
+              "api/create-schema-builder",
+              "api/schema-builder-methods"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Repository Methods",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "api/read-methods",
+              "api/write-methods",
+              "api/delete-methods"
+            ]
+          },
+          {
+            "group": "Query Types",
+            "pages": [
+              "api/filter-query",
+              "api/search-query",
+              "api/update-set"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

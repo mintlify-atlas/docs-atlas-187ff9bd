@@ -1,0 +1,651 @@
+---
+title: "SchemaBuilder Methods — Full Builder API Reference"
+description: "Full reference for every method on the SchemaBuilder class: profiles, events, policies, middleware, table config, logging, and build."
+---
+
+`SchemaBuilder` is the fluent configuration object returned by
+[`createSchemaBuilder`](/api/create-schema-builder). You chain its methods to
+register profiles, access-control policies, Koa-style middleware, relation
+metadata, logging, and telemetry before finalising the configuration with
+`.build()`. Most methods mutate and return `this`; `.profiles()` and `.table()`
+return a new `SchemaBuilder` with updated type parameters.
+
+---
+
+## `.profiles()`
+
+```typescript
+profiles<const P extends readonly string[]>(
+  profiles: P
+): SchemaBuilder<TDb, TTables, TMetadata, P>
+```
+
+Registers the set of valid profile names for this builder. Profiles represent
+the roles or personas that will be passed to repository methods at runtime
+(e.g. `"admin"`, `"public"`, `"user"`). Calling this method creates a new
+`SchemaBuilder` whose `TProfiles` type parameter is narrowed to the provided
+literal tuple, giving compile-time checks on `.policies()` profile keys and
+repository call sites.
+
+<ParamField path="profiles" type="readonly string[]" required>
+  A `const` tuple of string literals that name each valid profile.
+  Must include `"default"` if you rely on the default fallback profile.
+</ParamField>
+
+```typescript
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const)
+  .profiles(["default", "public", "admin", "user"] as const);
+```
+
+<Note>
+  Pass the array with `as const` so TypeScript infers the individual string
+  literals rather than `string[]`. Without it, policy profile keys lose their
+  narrowed type.
+</Note>
+
+---
+
+## `.on()`
+
+```typescript
+on<K extends keyof CastorEvents>(
+  type: K,
+  handler: (event: CastorEvents[K]) => void
+): this
+```
+
+Subscribes a handler to a telemetry event emitted by the Castor runtime.
+Returns `this` for chaining. All registered handlers fire asynchronously after
+each operation completes.
+
+<ParamField path="type" type="K extends keyof CastorEvents" required>
+  The event name to subscribe to. Available events:
+
+  <Expandable title="CastorEvents keys">
+    | Event | Payload type | When it fires |
+    |-------|-------------|---------------|
+    | `"execution"` | `ExecutionEventPayload` | After every repository operation, success or failure. |
+    | `"security"` | `SecurityEventPayload` | When a field is trimmed, an action is denied, or an unknown operator is encountered. |
+    | `"parser"` | `{ rawQuery: any; reason: string; isModified: boolean }` | When the query AST is modified during translation. |
+    | `"error"` | `ErrorEventPayload` | When an unhandled error occurs during execution. |
+    | `"soft-deleted"` | `MutationEventPayload` | After a successful soft-delete operation. |
+    | `"restored"` | `MutationEventPayload` | After a successful restore operation. |
+    | `"hard-deleted"` | `MutationEventPayload` | After a successful hard-delete operation. |
+  </Expandable>
+</ParamField>
+
+<ParamField path="handler" type="(event: CastorEvents[K]) => void" required>
+  The callback invoked with the typed event payload.
+</ParamField>
+
+```typescript
+builder
+  .on("execution", (ev) => {
+    // ev: ExecutionEventPayload
+    myMetrics.histogram("db_latency", ev.duration, { table: ev.tableName });
+  })
+  .on("security", (ev) => {
+    // ev: SecurityEventPayload
+    console.warn(`[Audit] Security event on ${ev.tableName}: ${ev.message}`);
+  })
+  .on("error", (ev) => {
+    // ev: ErrorEventPayload
+    Sentry.captureException(ev.error);
+  });
+```
+
+---
+
+## `.off()`
+
+```typescript
+off<K extends keyof CastorEvents>(
+  type: K,
+  handler: (event: CastorEvents[K]) => void
+): this
+```
+
+Unsubscribes a previously registered event handler. You must pass the exact
+same function reference that was passed to `.on()`.
+
+<ParamField path="type" type="K extends keyof CastorEvents" required>
+  The event name from which to remove the handler. See `.on()` for the full
+  list of available event names.
+</ParamField>
+
+<ParamField path="handler" type="(event: CastorEvents[K]) => void" required>
+  The exact handler function reference to remove.
+</ParamField>
+
+```typescript
+const executionHandler = (ev: ExecutionEventPayload) => {
+  console.log(ev.traceId);
+};
+
+builder.on("execution", executionHandler);
+// ... later:
+builder.off("execution", executionHandler);
+```
+
+---
+
+## `.policies()`
+
+`policies` has two overloads: a global fallback and a table-specific form.
+
+### Global policy overload
+
+```typescript
+policies(
+  policy: GlobalPolicyDefinition<TSchemaContext<TDb, TTables, TMetadata>, TProfiles[number]>
+): this
+```
+
+Registers a **global fallback policy** that applies to every table that does
+not have its own table-specific policy. The function receives the current
+`ExecutionContext`, the name of the table being queried, and the active
+profiles array.
+
+<ParamField path="policy" type="GlobalPolicyDefinition" required>
+  A function with the signature:
+
+  ```typescript
+  (
+    ctx: ExecutionContext,
+    tableName: string,
+    activeProfiles: string[],
+  ) => UnifiedPolicyConfig | Promise<UnifiedPolicyConfig>
+  ```
+
+  <Expandable title="UnifiedPolicyConfig fields">
+    <ResponseField name="allowedActions" type='readonly DbAction[] | "*"'>
+      Actions the profile may perform: `"create"`, `"read"`, `"update"`,
+      `"softDelete"`, `"restore"`, `"hardDelete"`, or `"*"` for all.
+    </ResponseField>
+    <ResponseField name="allowedProjections" type='readonly string[] | "*" | function'>
+      Fields that may appear in SELECT clauses. Supports dot-notation paths
+      and relational paths (e.g. `"posts.title"`).
+    </ResponseField>
+    <ResponseField name="allowedFilters" type='readonly string[] | "*" | function'>
+      Fields that may be used in WHERE clauses. The RBAC engine recursively
+      trims disallowed nodes from `$and`/`$or`/`$not` AST trees.
+    </ResponseField>
+    <ResponseField name="allowedSets" type='readonly string[] | "*" | function'>
+      Column keys that may appear in INSERT/UPDATE payloads.
+    </ResponseField>
+    <ResponseField name="allowedSorts" type='readonly string[] | "*" | function'>
+      Fields that may be used in ORDER BY clauses.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+```typescript
+builder.policies((ctx, tableName, profiles) => {
+  if (profiles.includes("admin")) return { allowedActions: "*" };
+  return { allowedActions: ["read"] }; // read-only fallback for everything else
+});
+```
+
+### Table-specific policy overload
+
+```typescript
+policies<TName extends TableName<TTables[number]>>(
+  tableName: TName,
+  policy: PolicyDefinition<TSchemaContext<TDb, TTables, TMetadata>, TName, TProfiles[number]>
+): this
+```
+
+Registers a policy scoped to a single named table. Takes precedence over the
+global policy for that table. `PolicyDefinition` can be either a static
+profile map or a single async function.
+
+<ParamField path="tableName" type="TName extends TableName<TTables[number]>" required>
+  The literal name of the table as declared in the Drizzle schema.
+</ParamField>
+
+<ParamField path="policy" type="PolicyDefinition" required>
+  Either a **profile map** (an object keyed by profile names, each value being
+  a `UnifiedPolicyConfig` or an async function returning one) or a **single
+  async function** `(ctx, activeProfiles) => UnifiedPolicyConfig`.
+</ParamField>
+
+```typescript
+builder.policies("users", {
+  // Static policy for "public" profile
+  public: {
+    allowedActions: ["read"],
+    allowedFilters: ["name", "email", "settings.theme"],
+    allowedProjections: ["name", "profile.bio"],
+  },
+
+  // Full access for "admin"
+  admin: {
+    allowedActions: "*",
+    allowedSets: "*",
+    allowedProjections: "*",
+    allowedFilters: "*",
+    allowedSorts: "*",
+  },
+
+  // Dynamic policy for "user" profile
+  user: async (ctx) => {
+    const isOwner = ctx.params.id === ctx.state.userId;
+    return {
+      allowedActions: isOwner ? ["read", "update"] : ["read"],
+      allowedSets: ["settings.theme", "persona.skills"],
+      allowedProjections: ["*"],
+      allowedFilters: "*",
+      allowedSorts: "*",
+    };
+  },
+});
+```
+
+<Tip>
+  You can register both a global policy and table-specific policies in the same
+  builder. Table-specific policies always win for their own table; the global
+  policy handles everything else.
+</Tip>
+
+---
+
+## `.use()`
+
+```typescript
+use(middleware: Middleware, config?: MiddlewareConfig<TTables>): this
+```
+
+Registers a **Koa-style middleware** that intercepts every repository operation
+before it reaches the RBAC layer and the database. Middleware runs in
+registration order. Each function receives an `ExecutionContext` and a `next`
+callback; you must call and `await next()` to continue the pipeline.
+
+<ParamField path="middleware" type="Middleware" required>
+  An async function with the signature:
+
+  ```typescript
+  (ctx: ExecutionContext, next: () => Promise<any>) => Promise<any>
+  ```
+
+  `ctx` exposes: `action`, `tableName`, `profile`, `params`, `metadata`, and
+  the full `translatorContext` (db, tables, metadata).
+</ParamField>
+
+<ParamField path="config" type="MiddlewareConfig" default="undefined">
+  Optional scoping configuration.
+
+  <Expandable title="MiddlewareConfig fields">
+    <ResponseField name="tables" type='TableName | TableName[]'>
+      Limit this middleware to one or more specific tables. If omitted, the
+      middleware runs for all tables.
+    </ResponseField>
+    <ResponseField name="actions" type='DbAction | DbAction[]'>
+      Limit this middleware to specific actions (`"create"`, `"read"`,
+      `"update"`, `"softDelete"`, `"restore"`, `"hardDelete"`). If omitted,
+      the middleware runs for all actions.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+```typescript
+// Runs for every table and every action
+builder.use(async (ctx, next) => {
+  console.log(`[${ctx.action}] → ${ctx.tableName}`);
+  const result = await next();
+  console.log(`[${ctx.action}] ← ${ctx.tableName} done`);
+  return result;
+});
+
+// Scoped to the "users" table, "create" and "update" actions only
+builder.use(
+  async (ctx, next) => {
+    ctx.metadata.requestedAt = Date.now();
+    return next();
+  },
+  { tables: "users", actions: ["create", "update"] },
+);
+```
+
+---
+
+## `.table()`
+
+```typescript
+table<
+  TName extends TableName<TTables[number]>,
+  const TConfig extends TSchemaMetadata<TDb, TTables>[TName],
+>(
+  tableName: TName,
+  config: TConfig,
+): SchemaBuilder<TDb, TTables, TMetadata & { [K in TName]: TConfig }, TProfiles>
+```
+
+Registers **relation definitions** and **soft-delete configuration** for a
+table. Returns a new `SchemaBuilder` whose `TMetadata` type parameter is
+extended with the supplied config, giving downstream methods full type
+information about which tables have soft-delete enabled.
+
+<ParamField path="tableName" type="TName extends TableName<TTables[number]>" required>
+  The literal name of the table as declared in the Drizzle schema.
+</ParamField>
+
+<ParamField path="config" type="TConfig extends TSchemaMetadata[TName]" required>
+  Table-level metadata. All fields are optional.
+
+  <Expandable title="config fields">
+    <ResponseField name="oneToOne" type="readonly RelationConfig[]">
+      One-to-one relation definitions. Each entry requires:
+      `relationName`, `relatedTable`, `localKey` (`"tableName.column"`),
+      `foreignKey` (`"tableName.column"`).
+    </ResponseField>
+    <ResponseField name="oneToMany" type="readonly RelationConfig[]">
+      One-to-many relation definitions. Same shape as `oneToOne`.
+    </ResponseField>
+    <ResponseField name="manyToOne" type="readonly RelationConfig[]">
+      Many-to-one relation definitions. Same shape as `oneToOne`.
+    </ResponseField>
+    <ResponseField name="manyToMany" type="readonly ManyToManyConfig[]">
+      Many-to-many relation definitions. Each entry additionally requires:
+      `joinTable`, `joinLocalKey`, `joinRelatedKey`, and `relatedKey`.
+    </ResponseField>
+    <ResponseField name="softDelete" type="object">
+      Enables soft-delete behaviour for the table.
+
+      <Expandable title="softDelete fields">
+        <ResponseField name="deleteValue" type="Partial<TableRow>">
+          Column values to write when soft-deleting a record
+          (e.g. `{ deletedFlag: 1 }`).
+        </ResponseField>
+        <ResponseField name="restoreValue" type="Partial<TableRow>">
+          Column values to write when restoring a soft-deleted record
+          (e.g. `{ deletedFlag: 0 }`).
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+```typescript
+builder.table("users", {
+  oneToOne: [
+    {
+      relationName: "profile",
+      relatedTable: "profiles",
+      localKey: "users.id",
+      foreignKey: "profiles.userId",
+    },
+  ],
+  oneToMany: [
+    {
+      relationName: "posts",
+      relatedTable: "posts",
+      localKey: "users.id",
+      foreignKey: "posts.userId",
+    },
+  ],
+  softDelete: {
+    deleteValue: { deletedFlag: 1 },
+    restoreValue: { deletedFlag: 0 },
+  },
+});
+```
+
+---
+
+## `.withLogger()`
+
+```typescript
+withLogger(config: LoggerConfig): this
+```
+
+Configures the internal Castor logger. By default the logger is set to
+`"WARN"`. Call this method to increase verbosity during development or to
+reduce it in production.
+
+<ParamField path="config" type="LoggerConfig" required>
+  Logger configuration object.
+
+  <Expandable title="LoggerConfig fields">
+    <ResponseField name="level" type="LogLevel" default='"WARN"'>
+      Minimum severity to emit. One of:
+      `"TRACE"` | `"DEBUG"` | `"INFO"` | `"WARN"` | `"ERROR"` | `"FATAL"` | `"OFF"`.
+
+      | Level | What gets logged |
+      |-------|-----------------|
+      | `"TRACE"` | Extremely detailed — operation params, internal pipeline steps |
+      | `"DEBUG"` | Table registration, middleware application, core SQL calls |
+      | `"INFO"` | Operation start/end, build summary |
+      | `"WARN"` | Lenient-mode notices, policy fallbacks |
+      | `"ERROR"` | Caught execution errors |
+      | `"FATAL"` | Unrecoverable failures |
+      | `"OFF"` | No output |
+    </ResponseField>
+    <ResponseField name="format" type="string">
+      Optional log format pattern string (Quarkus-style,
+      e.g. `"%d{HH:mm:ss} %p [%c] (%t) %s"`).
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+```typescript
+builder.withLogger({
+  level: "INFO",
+  format: "%d{HH:mm:ss} %p [%c] (%t) %s",
+});
+```
+
+---
+
+## `.withThrowError()`
+
+```typescript
+withThrowError(val: boolean): this
+```
+
+Controls what happens when the RBAC engine trims an unauthorized field from a
+query clause. By default (`false`), trimming is silent — the field is removed
+and execution continues. When set to `true`, any unauthorized field causes an
+error to be thrown immediately instead.
+
+<ParamField path="val" type="boolean" required>
+  - `false` (default): Silently drop unauthorized fields and continue.
+  - `true`: Throw an error when any unauthorized field is encountered during
+    query trimming.
+</ParamField>
+
+```typescript
+// Strict field-level enforcement — throw instead of silently trim
+builder.withThrowError(true);
+```
+
+<Warning>
+  Enabling `withThrowError(true)` changes the silent-trim behaviour described
+  in the RBAC documentation. Callers will receive thrown errors for any field
+  that does not appear in their active policy's allow-lists, so ensure all
+  client queries only request permitted fields before enabling this in
+  production.
+</Warning>
+
+---
+
+## `.withTraceIdGenerator()`
+
+```typescript
+withTraceIdGenerator(gen: TraceIdGenerator): this
+```
+
+Replaces the built-in random trace-ID generator with a custom function. The
+generator is called once per repository operation and its return value is
+attached to `ExecutionEventPayload.traceId` and `MutationEventPayload.traceId`.
+
+<ParamField path="gen" type="TraceIdGenerator" required>
+  A synchronous or asynchronous function that returns a `string` used as the
+  trace ID for each operation:
+
+  ```typescript
+  type TraceIdGenerator = () => string | Promise<string>;
+  ```
+</ParamField>
+
+```typescript
+import { randomUUID } from "crypto";
+
+// Use Node's built-in UUID generator as the trace ID source
+builder.withTraceIdGenerator(() => randomUUID());
+
+// Or propagate an incoming HTTP request's trace ID via AsyncLocalStorage
+builder.withTraceIdGenerator(() => requestContext.get("traceId") ?? randomUUID());
+```
+
+---
+
+## `.build()`
+
+```typescript
+build(): CastorInstance<TDb, TTables, TMetadata>
+```
+
+Finalises all registered configuration and returns a `CastorInstance`. Call
+`.build()` once, after all chained configuration is complete, and export the
+result for use across your application.
+
+**Returns** a `CastorInstance` with the following shape:
+
+<ResponseField name="db" type="TDb">
+  The original Drizzle database instance passed to `createSchemaBuilder`.
+</ResponseField>
+
+<ResponseField name="tables" type="TTables">
+  The original table tuple passed to `createSchemaBuilder`.
+</ResponseField>
+
+<ResponseField name="metadata" type="TMetadata">
+  The merged metadata object built up through `.table()` calls.
+</ResponseField>
+
+<ResponseField name="repoFactory" type="(tableName: TName) => Repository">
+  Factory function that creates a fully typed, middleware-and-policy-wrapped
+  `Repository` for the named table. Only tables registered via `.table()` are
+  accepted by the type system.
+
+  <Expandable title="Repository methods">
+    | Method | Description |
+    |--------|-------------|
+    | `createOne(data, profile)` | Insert a single record |
+    | `createMany(data, profile)` | Insert multiple records |
+    | `searchOne(query, profile)` | Fetch a single record |
+    | `searchMany(query, profile)` | Fetch all matching records |
+    | `searchPage(query, profile)` | Fetch a paginated result set |
+    | `searchDeletedOne(query, profile)` | Fetch a single soft-deleted record |
+    | `searchDeletedMany(query, profile)` | Fetch all soft-deleted records |
+    | `searchDeletedPage(query, profile)` | Paginate soft-deleted records |
+    | `updateOne(id, set, profile)` | Update a record by primary key |
+    | `updateMany(filter, set, profile)` | Batch update by filter |
+    | `softDeleteOne(id, profile)` | Soft-delete by primary key |
+    | `softDeleteMany(filter, profile)` | Batch soft-delete by filter |
+    | `restoreOne(id, profile)` | Restore a soft-deleted record |
+    | `restoreMany(filter, profile)` | Batch restore by filter |
+    | `hardDeleteOne(id, profile)` | Permanently delete by primary key |
+    | `hardDeleteMany(filter, profile)` | Permanently batch delete by filter |
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="subscribeToTelemetry" type="(subscriber) => () => void">
+  Alternative low-level telemetry subscription API. Returns an unsubscribe
+  function. Prefer `.on()` / `.off()` on the builder for most use cases.
+</ResponseField>
+
+```typescript
+// Finalise the builder
+export const schemaMetadata = schemaMetadataBuilder.build();
+
+// Create a repository for the "users" table
+const userRepo = schemaMetadata.repoFactory("users");
+
+// Use the repository
+const user = await userRepo.searchOne(
+  {
+    projection: ["name", "profile.bio", "posts.title"],
+    filter: { name: { $like: "%Jane%" } },
+  },
+  "admin",
+);
+```
+
+---
+
+## Full chained example
+
+The example below shows a complete builder configuration drawn from the
+quickstart, using every major method in a single chain.
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import { usersTable, postsTable, profilesTable } from "./schema";
+import { randomUUID } from "crypto";
+
+const db = drizzle("sqlite.db");
+
+export const schemaMetadata = createSchemaBuilder(
+  db,
+  [usersTable, postsTable, profilesTable] as const,
+  "strict",
+)
+  // 1. Register valid profiles
+  .profiles(["default", "public", "admin", "user"] as const)
+
+  // 2. Configure logging
+  .withLogger({ level: "INFO", format: "%d{HH:mm:ss} %p [%c] (%t) %s" })
+
+  // 3. Custom trace ID
+  .withTraceIdGenerator(() => randomUUID())
+
+  // 4. Throw on unauthorized field access instead of silently trimming
+  .withThrowError(false)
+
+  // 5. Telemetry
+  .on("execution", (ev) => {
+    console.log(`${ev.traceId} | ${ev.action} on ${ev.tableName} | ${ev.duration}ms`);
+  })
+  .on("security", (ev) => {
+    console.warn(`[Security] ${ev.type} on ${ev.tableName}: ${ev.message}`);
+  })
+
+  // 6. Global fallback policy
+  .policies((ctx, tableName, profiles) => {
+    if (profiles.includes("admin")) return { allowedActions: "*" };
+    return { allowedActions: ["read"] };
+  })
+
+  // 7. Table-specific policy
+  .policies("users", {
+    public: { allowedActions: ["read"], allowedProjections: ["name", "email"] },
+    admin: { allowedActions: "*", allowedSets: "*", allowedProjections: "*", allowedFilters: "*", allowedSorts: "*" },
+  })
+
+  // 8. Middleware
+  .use(async (ctx, next) => {
+    const start = Date.now();
+    const result = await next();
+    console.log(`Middleware: ${ctx.action} on ${ctx.tableName} took ${Date.now() - start}ms`);
+    return result;
+  })
+
+  // 9. Table relation and soft-delete metadata
+  .table("users", {
+    oneToOne: [
+      { relationName: "profile", relatedTable: "profiles", localKey: "users.id", foreignKey: "profiles.userId" },
+    ],
+    oneToMany: [
+      { relationName: "posts", relatedTable: "posts", localKey: "users.id", foreignKey: "posts.userId" },
+    ],
+    softDelete: {
+      deleteValue: { deletedFlag: 1 },
+      restoreValue: { deletedFlag: 0 },
+    },
+  })
+
+  // 10. Finalise
+  .build();
+```

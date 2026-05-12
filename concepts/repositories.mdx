@@ -1,0 +1,425 @@
+---
+title: "Working with Repositories in Drizzle Castor"
+description: "Understand how repoFactory creates typed repositories, the full method surface for CRUD, soft deletes, and restore, and how TypeScript infers return shapes."
+---
+
+Once you have a `CastorInstance` from `.build()`, you call `repoFactory(tableName)` to obtain a repository. The repository is a collection of strongly typed async methods that covers every database operation Castor supports — from single-record inserts to paginated reads with nested relations. TypeScript binds the repository to the named table at call-site, so filter paths, projection arrays, and insert shapes are all validated against your actual Drizzle column definitions.
+
+## Obtaining a repository
+
+```typescript
+import { schemaMetadata } from "./castor";
+
+const userRepo = schemaMetadata.repoFactory("users");
+```
+
+`repoFactory` is generic over `TName`, which must be a key of the metadata map you built via `.table()` calls. The returned `Repository<TSchema, TName>` exposes two categories of members: **factory helpers** for constructing typed query fragments, and **core methods** for executing operations.
+
+## Factory helpers
+
+Factory helpers are no-op identity functions whose only job is to capture TypeScript generics and give you autocomplete when building reusable query fragments. They do not touch the database.
+
+<AccordionGroup>
+  <Accordion title="defineFilter">
+    Returns a typed `FilterQuery<TEntity>` value. Use this to define a reusable filter outside the call-site.
+
+    ```typescript
+    const activeUsers = userRepo.defineFilter({
+      deletedFlag: { $eq: 0 },
+      age: { $gte: 18 },
+    });
+
+    const users = await userRepo.searchMany({ filter: activeUsers }, "admin");
+    ```
+  </Accordion>
+  <Accordion title="defineProjection">
+    Returns a typed array of dot-notation paths that can be passed as `projection`. TypeScript infers the element type from the declared paths.
+
+    ```typescript
+    const publicFields = userRepo.defineProjection([
+      "name",
+      "email",
+      "profile.bio",
+      "settings.theme",
+    ]);
+
+    const user = await userRepo.searchOne({ projection: publicFields }, "public");
+    ```
+  </Accordion>
+  <Accordion title="defineQuery">
+    Returns a typed `OrderQuery<TEntity>` value for reusable order configurations.
+
+    ```typescript
+    const latestFirst = userRepo.defineQuery({
+      createdAt: "desc",
+      "posts.comments.createdAt": { direction: "desc", nulls: "last" },
+    });
+    ```
+  </Accordion>
+  <Accordion title="defineUpdateSet">
+    Returns a typed `UpdateSet<TInsert>` value. Useful for shared update payloads.
+
+    ```typescript
+    const markActive = userRepo.defineUpdateSet({
+      "settings.notifications": true,
+    });
+    ```
+  </Accordion>
+  <Accordion title="defineInsertValue">
+    Returns a typed insert payload. Helpful when constructing insert data outside the call-site with full type checking.
+
+    ```typescript
+    const newUser = userRepo.defineInsertValue({
+      name: "Jane Doe",
+      email: "jane@example.com",
+    });
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Passing profiles
+
+Every core method accepts an optional `profile` parameter as its last argument. This value is matched against the policies registered on the builder via `.policies()`. Pass a single string or an array of strings; if you pass an array, the RBAC engine unions the capabilities of every matched profile.
+
+```typescript
+// Single profile
+await userRepo.searchMany({}, "admin");
+
+// Multiple profiles — capabilities are unioned
+await userRepo.searchMany({}, ["public", "editor"]);
+
+// No profile — falls back to "default"
+await userRepo.searchMany({});
+```
+
+<Info>
+  In `strict` mode, calling without a profile or with a profile that has no registered policy throws an `AccessDeniedError` before the query runs.
+</Info>
+
+## Create methods
+
+<Steps>
+  <Step title="createOne">
+    Inserts a single record and returns the full hydrated entity.
+
+    ```typescript
+    const newUser = await userRepo.createOne(
+      {
+        name: "Jane Doe",
+        email: "jane@example.com",
+      },
+      "admin",
+    );
+    // Returns: TEntity (full row)
+    ```
+  </Step>
+  <Step title="createMany">
+    Inserts multiple records in one operation and returns an array of the created entities.
+
+    ```typescript
+    const newUsers = await userRepo.createMany(
+      [
+        { name: "Alice", email: "alice@example.com" },
+        { name: "Bob",   email: "bob@example.com"   },
+      ],
+      "admin",
+    );
+    // Returns: TEntity[]
+    ```
+  </Step>
+</Steps>
+
+## Read methods
+
+All read methods accept a query object whose shape is validated against the entity type. The `projection` array shapes the TypeScript return type at compile time via `DeepPick`.
+
+### `searchOne`
+
+Returns a single record matching the filter, or `null` if none is found.
+
+```typescript
+const user = await userRepo.searchOne(
+  {
+    projection: ["name", "email", "profile.bio"],
+    filter: { email: { $eq: "jane@example.com" } },
+    order:  { createdAt: "desc" },
+  },
+  "admin",
+);
+// Returns: { name: string; email: string; profile: { bio: string | null } } | null
+```
+
+### `searchMany`
+
+Returns all records matching the filter as an array. Does not support `page` or `pageSize`.
+
+```typescript
+const users = await userRepo.searchMany(
+  {
+    filter: { age: { $gte: 18 } },
+    order:  { createdAt: "desc" },
+  },
+  "admin",
+);
+// Returns: TEntity[]
+```
+
+### `searchPage`
+
+Returns a paginated result set with metadata. Use this for list views that need total counts.
+
+```typescript
+const page = await userRepo.searchPage(
+  {
+    page:     1,
+    pageSize: 10,
+    filter:   { "posts.comments.content": { $notIsNull: true } },
+    order:    { createdAt: "desc" },
+  },
+  "public",
+);
+
+// Returns:
+// {
+//   data: TEntity[];
+//   meta: {
+//     currentPage: number;
+//     pageSize:    number;
+//     totalPages:  number;
+//     totalItems:  number;
+//   };
+// }
+```
+
+<Tip>
+  `searchPage` uses a CTE split-query strategy internally to avoid Cartesian fan-out when one-to-many joins are involved, keeping pagination counts accurate.
+</Tip>
+
+### Projection and return type inference
+
+When you pass a `projection` array, TypeScript picks only the requested paths from the entity type:
+
+```typescript
+const result = await userRepo.searchOne(
+  { projection: ["name", "settings.theme"] },
+  "admin",
+);
+
+// result is typed as:
+// { name: string; settings: { theme: string } } | null
+// — not the full TEntity
+```
+
+This inference is powered by the `DeepPick<TEntity, Q["projection"][number]>` utility type defined in `src/types/repository.ts`.
+
+## Soft-delete read variants
+
+When a table has `softDelete` configured, its active records exclude soft-deleted rows automatically. To query the deleted records explicitly, use the `searchDeleted*` variants:
+
+<CodeGroup>
+
+```typescript searchDeletedOne
+const deleted = await userRepo.searchDeletedOne(
+  { filter: { id: { $eq: 1 } } },
+  "admin",
+);
+// Returns the soft-deleted record or null
+```
+
+```typescript searchDeletedMany
+const allDeleted = await userRepo.searchDeletedMany(
+  { order: { deletedAt: "desc" } },
+  "admin",
+);
+// Returns TEntity[]
+```
+
+```typescript searchDeletedPage
+const deletedPage = await userRepo.searchDeletedPage(
+  { page: 1, pageSize: 25 },
+  "admin",
+);
+// Returns paginated deleted records with meta
+```
+
+</CodeGroup>
+
+## Update methods
+
+### `updateOne`
+
+Updates a record by its primary key. Returns the updated entity or `null` if no record was found.
+
+```typescript
+const updated = await userRepo.updateOne(
+  1,                          // primary key
+  {
+    name: "John Updated",
+    "settings.theme": "light", // partial JSON column update
+  },
+  "admin",
+);
+// Returns: TEntity | null
+```
+
+### `updateMany`
+
+Updates all records matching a filter. Returns the array of updated entities.
+
+```typescript
+const updated = await userRepo.updateMany(
+  { age: { $lt: 18 } },              // filter
+  { "settings.notifications": false }, // set
+  "admin",
+);
+// Returns: TEntity[]
+```
+
+<Note>
+  On PostgreSQL and SQLite, `updateMany` uses a `RETURNING` clause for atomic batch updates. On MySQL, Castor falls back to a temporary-table strategy to avoid race conditions. See [Multi-dialect support](/advanced/multi-dialect) for details.
+</Note>
+
+## Soft-delete and restore methods
+
+Soft-delete methods write the `deleteValue` configured on the table (e.g., `{ deletedFlag: 1 }`) rather than removing the row. Subsequent `searchOne`, `searchMany`, and `searchPage` calls automatically exclude soft-deleted rows.
+
+<Tabs>
+  <Tab title="Soft delete">
+
+    ```typescript
+    // Delete a single record by primary key
+    const success = await userRepo.softDeleteOne(1, "admin");
+    // Returns: boolean
+
+    // Delete all records matching a filter
+    const count = await userRepo.softDeleteMany(
+      { "settings.theme": { $eq: "light" } },
+      "admin",
+    );
+    // Returns: number (rows affected)
+    ```
+
+  </Tab>
+  <Tab title="Restore">
+
+    ```typescript
+    // Restore a single soft-deleted record by primary key
+    const restored = await userRepo.restoreOne(1, "admin");
+    // Returns: boolean
+
+    // Restore all matching soft-deleted records
+    const count = await userRepo.restoreMany(
+      { deletedAt: { $lte: Date.now() } },
+      "admin",
+    );
+    // Returns: number (rows affected)
+    ```
+
+  </Tab>
+</Tabs>
+
+## Hard-delete methods
+
+Hard delete permanently removes rows. There is no recovery path.
+
+```typescript
+// Delete a single record permanently by primary key
+const removed = await userRepo.hardDeleteOne(1, "admin");
+// Returns: boolean
+
+// Delete all matching records permanently
+const count = await userRepo.hardDeleteMany(
+  { age: { $lt: 13 } },
+  "admin",
+);
+// Returns: number (rows affected)
+```
+
+<Warning>
+  `hardDeleteOne` and `hardDeleteMany` bypass any soft-delete configuration and issue a physical `DELETE` statement. Rows are unrecoverable after this call.
+</Warning>
+
+## Full method reference
+
+<Expandable title="All repository methods">
+  <ResponseField name="defineFilter" type="(filter: FilterQuery) => FilterQuery">
+    Type-safe factory for reusable filter objects.
+  </ResponseField>
+  <ResponseField name="defineProjection" type="(paths: ValidPath[]) => ValidPath[]">
+    Type-safe factory for reusable projection arrays.
+  </ResponseField>
+  <ResponseField name="defineQuery" type="(order: OrderQuery) => OrderQuery">
+    Type-safe factory for reusable order configurations.
+  </ResponseField>
+  <ResponseField name="defineUpdateSet" type="(set: UpdateSet) => UpdateSet">
+    Type-safe factory for reusable update payloads.
+  </ResponseField>
+  <ResponseField name="defineInsertValue" type="(data: TInsert) => TInsert">
+    Type-safe factory for reusable insert payloads.
+  </ResponseField>
+  <ResponseField name="createOne" type="(data, profile?) => Promise<TEntity>">
+    Insert one record and return it.
+  </ResponseField>
+  <ResponseField name="createMany" type="(data[], profile?) => Promise<TEntity[]>">
+    Insert multiple records and return them.
+  </ResponseField>
+  <ResponseField name="searchOne" type="(query, profile?) => Promise<TEntity | null>">
+    Find the first record matching the query.
+  </ResponseField>
+  <ResponseField name="searchMany" type="(query, profile?) => Promise<TEntity[]>">
+    Find all records matching the query.
+  </ResponseField>
+  <ResponseField name="searchPage" type="(query, profile?) => Promise<{ data, meta }>">
+    Find paginated records with total count metadata.
+  </ResponseField>
+  <ResponseField name="searchDeletedOne" type="(query, profile?) => Promise<TEntity | null>">
+    Find a single soft-deleted record.
+  </ResponseField>
+  <ResponseField name="searchDeletedMany" type="(query, profile?) => Promise<TEntity[]>">
+    Find all soft-deleted records matching the query.
+  </ResponseField>
+  <ResponseField name="searchDeletedPage" type="(query, profile?) => Promise<{ data, meta }>">
+    Paginate through soft-deleted records.
+  </ResponseField>
+  <ResponseField name="updateOne" type="(id, set, profile?) => Promise<TEntity | null>">
+    Update a single record by primary key.
+  </ResponseField>
+  <ResponseField name="updateMany" type="(filter, set, profile?) => Promise<TEntity[]>">
+    Update all records matching the filter.
+  </ResponseField>
+  <ResponseField name="softDeleteOne" type="(id, profile?) => Promise<boolean>">
+    Soft-delete a single record by primary key.
+  </ResponseField>
+  <ResponseField name="softDeleteMany" type="(filter, profile?) => Promise<number>">
+    Soft-delete all records matching the filter.
+  </ResponseField>
+  <ResponseField name="restoreOne" type="(id, profile?) => Promise<boolean>">
+    Restore a single soft-deleted record by primary key.
+  </ResponseField>
+  <ResponseField name="restoreMany" type="(filter, profile?) => Promise<number>">
+    Restore all soft-deleted records matching the filter.
+  </ResponseField>
+  <ResponseField name="hardDeleteOne" type="(id, profile?) => Promise<boolean>">
+    Permanently delete a single record by primary key.
+  </ResponseField>
+  <ResponseField name="hardDeleteMany" type="(filter, profile?) => Promise<number>">
+    Permanently delete all records matching the filter.
+  </ResponseField>
+</Expandable>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="JSON-based querying" icon="filter" href="/concepts/json-querying">
+    Learn the full filter operator vocabulary and how to write complex nested queries.
+  </Card>
+  <Card title="Soft deletes" icon="trash" href="/advanced/soft-deletes">
+    Configure and customise soft-delete behaviour per table.
+  </Card>
+  <Card title="Pagination" icon="list" href="/advanced/pagination">
+    Understand the CTE split-query strategy and how to work with searchPage.
+  </Card>
+  <Card title="Type system" icon="braces" href="/advanced/type-system">
+    Explore how DeepPick and FlattenPaths provide end-to-end type safety.
+  </Card>
+</CardGroup>

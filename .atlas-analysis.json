@@ -1,0 +1,132 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Drizzle Castor",
+  "projectDescription": "A type-safe CRUD library and Data Access Object (DAO) abstraction over Drizzle ORM, providing JSON-based querying, a Koa-style middleware pipeline, unified RBAC, and multi-dialect support for PostgreSQL, MySQL, and SQLite.",
+  "theme": "luma",
+  "primaryColor": "#242b2c",
+  "lightColor": "#6a6a6d",
+  "darkColor": "#ebeaea",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/schema-builder",
+              "concepts/repositories",
+              "concepts/json-querying",
+              "concepts/relations"
+            ]
+          },
+          {
+            "group": "Access Control",
+            "pages": [
+              "access-control/overview",
+              "access-control/policies",
+              "access-control/profiles"
+            ]
+          },
+          {
+            "group": "Middleware & Extensibility",
+            "pages": [
+              "middleware/pipeline",
+              "middleware/telemetry",
+              "middleware/logging"
+            ]
+          },
+          {
+            "group": "Dialects & Advanced",
+            "pages": [
+              "advanced/multi-dialect",
+              "advanced/soft-deletes",
+              "advanced/pagination",
+              "advanced/type-system"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Builder API",
+            "pages": [
+              "api/create-schema-builder",
+              "api/schema-builder-methods"
+            ]
+          },
+          {
+            "group": "Repository Methods",
+            "pages": [
+              "api/read-methods",
+              "api/write-methods",
+              "api/delete-methods"
+            ]
+          },
+          {
+            "group": "Query Types",
+            "pages": [
+              "api/filter-query",
+              "api/search-query",
+              "api/update-set"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "JSON-based querying with AST translation to Drizzle ORM SQL",
+    "Koa-style onion middleware pipeline for extensible request interception",
+    "Unified Role-Based Access Control (RBAC) with action-level and field-level enforcement",
+    "Multi-dialect support for PostgreSQL, MySQL, and SQLite with dialect-specific strategies",
+    "Native soft-delete capabilities with implicit safety filters",
+    "Safe pagination using CTE Split Queries to prevent Cartesian fan-out",
+    "Event-driven telemetry via mitt for non-blocking observability",
+    "Quarkus-style pattern-based logging powered by pino",
+    "End-to-end TypeScript type safety with inferred schema types and DeepPick projection"
+  ],
+  "publicApiSurface": [
+    "createSchemaBuilder(db, tables, mode)",
+    "SchemaBuilder.profiles(profiles)",
+    "SchemaBuilder.policies(tableName, policyDefinition)",
+    "SchemaBuilder.use(middleware, config)",
+    "SchemaBuilder.table(tableName, config)",
+    "SchemaBuilder.withLogger(config)",
+    "SchemaBuilder.withTraceIdGenerator(gen)",
+    "SchemaBuilder.on(event, handler)",
+    "SchemaBuilder.build()",
+    "CastorInstance.repoFactory(tableName)",
+    "Repository.createOne(data, profile)",
+    "Repository.createMany(data[], profile)",
+    "Repository.searchOne(query, profile)",
+    "Repository.searchMany(query, profile)",
+    "Repository.searchPage(query, profile)",
+    "Repository.searchDeletedOne(query, profile)",
+    "Repository.searchDeletedMany(query, profile)",
+    "Repository.searchDeletedPage(query, profile)",
+    "Repository.updateOne(id, set, profile)",
+    "Repository.updateMany(filter, set, profile)",
+    "Repository.softDeleteOne(id, profile)",
+    "Repository.softDeleteMany(filter, profile)",
+    "Repository.restoreOne(id, profile)",
+    "Repository.restoreMany(filter, profile)",
+    "Repository.hardDeleteOne(id, profile)",
+    "Repository.hardDeleteMany(filter, profile)",
+    "Repository.defineFilter(filter)",
+    "Repository.defineProjection(projection)",
+    "Repository.defineQuery(query)",
+    "Repository.defineUpdateSet(set)",
+    "Repository.defineInsertValue(data)"
+  ]
+}

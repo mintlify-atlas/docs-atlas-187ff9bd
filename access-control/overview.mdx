@@ -1,0 +1,187 @@
+---
+title: "Role-Based Access Control in Drizzle Castor"
+description: "How Drizzle Castor's Unified RBAC engine enforces strict or lenient access control across five field-level dimensions before any query hits the database."
+---
+
+Drizzle Castor enforces security at the data access layer itself, not in service functions scattered across your application. Every call to a repository method passes through the Unified RBAC middleware, which evaluates the active profile against registered policies, trims or rejects unauthorized fields, and either allows or halts execution — all before a single SQL statement is constructed or sent to the database.
+
+## How the RBAC middleware fits in the pipeline
+
+The full lifecycle of a query looks like this:
+
+```
+JSON Payload → Middleware (RBAC) → Query Parser (AST) → Executor → Drizzle ORM → DB Engine
+```
+
+The `createUnifiedRbacMiddleware` is composed into the middleware stack automatically when you call `builder.build()`. It runs first, intercepting every action regardless of which repository method triggered it. The middleware reads the active profile from the execution context, resolves the matching policy, and applies access checks before calling `next()` to hand off to the query translator.
+
+<Note>
+The RBAC middleware is not optional — it is always present in the middleware pipeline. Tables without a registered policy are handled according to the configured execution mode (strict or lenient).
+</Note>
+
+## Strict vs lenient mode
+
+When you create a schema builder with `createSchemaBuilder`, you choose an execution mode as the third argument:
+
+```typescript
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+
+// Lenient mode: tables without policies are fully open
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const, "lenient");
+
+// Strict mode: every table must have an explicit policy or access is denied
+const strictBuilder = createSchemaBuilder(db, [usersTable, postsTable] as const, "strict");
+```
+
+<Tabs>
+  <Tab title="Lenient (default)">
+    If a table has no policy registered at all, all actions are permitted. Unspecified rules default to allowing access. This is useful during development when you want to start wiring up policies incrementally without immediately locking down every table.
+  </Tab>
+  <Tab title="Strict">
+    Every table **must** have an explicit policy. If an operation targets a table with no registered policy, the middleware immediately throws an `AccessDeniedError` — no query reaches the database.
+
+    ```typescript
+    // In strict mode, this throws AccessDeniedError if "orders" has no policy
+    const result = await ordersRepo.searchMany({}, "user");
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+In strict mode, attempting to query a table that has no associated policy raises `AccessDeniedError` with the message: `[Access Denied] Table 'tableName' has no policies defined in strict mode.`
+</Warning>
+
+## The five control dimensions
+
+Every `UnifiedPolicyConfig` object can specify up to five dimensions of access control. Each dimension controls a different clause of the resulting SQL query.
+
+<AccordionGroup>
+  <Accordion title="allowedActions — which operations are permitted" defaultOpen={true}>
+    Controls which database operations the profile can execute. The available action strings map directly to repository methods:
+
+    | Action string  | Repository methods                                  |
+    | -------------- | --------------------------------------------------- |
+    | `"create"`     | `createOne`, `createMany`                           |
+    | `"read"`       | `searchOne`, `searchMany`, `searchPage`             |
+    | `"update"`     | `updateOne`, `updateMany`                           |
+    | `"softDelete"` | `softDeleteOne`, `softDeleteMany`                   |
+    | `"restore"`    | `restoreOne`                                        |
+    | `"hardDelete"` | `hardDeleteOne`, `hardDeleteMany`                   |
+
+    Set this to `"*"` to grant unrestricted access to all operations. If the active profile attempts an action not in the array, the middleware throws `AccessDeniedError` immediately.
+
+    ```typescript
+    // Read-only profile
+    public: { allowedActions: ["read"] }
+
+    // Full access profile
+    admin: { allowedActions: "*" }
+    ```
+  </Accordion>
+
+  <Accordion title="allowedProjections — what data can be returned (SELECT)">
+    Restricts which fields appear in the `SELECT` clause. If a caller requests `projection: ["name", "email", "passwordHash"]` but only `"name"` and `"email"` are in `allowedProjections`, the query executes as `SELECT name, email FROM ...` — the unauthorized field is silently dropped.
+
+    ```typescript
+    public: {
+      allowedActions: ["read"],
+      allowedProjections: ["name", "profile.bio", "settings.theme"],
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="allowedFilters — which fields can appear in WHERE clauses">
+    Controls which fields a profile may filter against. The engine recursively walks the `$and`/`$or`/`$not` filter tree and discards any leaf node that references a disallowed field. The rest of the filter continues to execute normally.
+
+    ```typescript
+    public: {
+      allowedActions: ["read"],
+      allowedFilters: ["name", "email", "settings.theme"],
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="allowedSets — which columns can be written (INSERT / UPDATE)">
+    Prevents writing to restricted columns during `create` and `update` operations. If the payload includes `{ name: "John", role: "admin" }` but `"role"` is not in `allowedSets`, only the `name` update is passed to the database.
+
+    ```typescript
+    user: {
+      allowedActions: ["read", "update"],
+      allowedSets: ["settings.theme", "persona.skills"],
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="allowedSorts — which fields can appear in ORDER BY">
+    Limits which columns a profile may sort by. Unauthorized sort keys are stripped from the `order` object before it reaches the AST translator.
+
+    ```typescript
+    public: {
+      allowedActions: ["read"],
+      allowedSorts: ["createdAt", "name"],
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Intelligent Data Trimming
+
+Rather than throwing a hard error the moment an unauthorized field appears in a projection, filter, or sort clause, Drizzle Castor applies **Intelligent Data Trimming** by default: unauthorized fields are silently removed and a warning is recorded in `ctx.state.warnings`. A `security` event is also emitted on the event bus so you can route it to your audit trail.
+
+```typescript
+builder.on("security", (ev) => {
+  console.warn(`[Audit] ${ev.type} on ${ev.tableName}: ${ev.message}`);
+});
+```
+
+The trimming behavior covers four scenarios:
+
+- **Projections**: unauthorized fields are dropped; the query still executes with the permitted subset.
+- **Filters**: the specific filter node for the unauthorized field is discarded; sibling conditions inside `$and`/`$or` are preserved.
+- **Sets (create/update)**: unauthorized keys are removed from the payload before the mutation reaches the database.
+- **Sorts**: unauthorized sort keys are deleted from the `order` object.
+
+<Note>
+If trimming leaves a clause completely empty (for example, every field in the projection was unauthorized), the middleware throws `AccessDeniedError` rather than continuing with an empty clause. Partial access is allowed; zero access is denied.
+</Note>
+
+You can switch from trimming to hard errors by calling `builder.withThrowError(true)`. In that mode, any unauthorized field immediately raises `AccessDeniedError` instead of being silently removed.
+
+```typescript
+const builder = createSchemaBuilder(db, tables, "strict")
+  .withThrowError(true); // unauthorized fields throw instead of being trimmed
+```
+
+## How multiple profiles are merged
+
+You can pass a single profile string or an array of profiles to any repository method:
+
+```typescript
+// Single profile
+await userRepo.searchOne({ projection: ["name"] }, "admin");
+
+// Multiple profiles — union semantics
+await userRepo.searchOne({ projection: ["name", "email"] }, ["public", "editor"]);
+```
+
+When an array of profiles is provided, the RBAC engine evaluates each matching policy entry and **merges** the results using union semantics:
+
+- **Actions**: the union of all allowed action lists. If any profile has `"*"`, the result is `"*"`.
+- **Field dimensions** (projections, filters, sets, sorts): arrays are deduplicated and merged. If any profile has `"*"` for a dimension, the merged result is `"*"`.
+
+This means a user who holds both the `"public"` and `"editor"` profiles gains the combined permissions of both, without either profile needing to enumerate the other's fields.
+
+<Tip>
+If no profile is passed to a repository method, the engine defaults to the `"default"` profile. Always define a `default` entry in your policy map to establish a safe baseline.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Defining policies" icon="file-shield" href="/access-control/policies">
+    Learn how to define table-specific policies, dynamic async callbacks, and global fallback policies.
+  </Card>
+  <Card title="Working with profiles" icon="users" href="/access-control/profiles">
+    Understand how to declare profiles with TypeScript safety and pass them to repository methods.
+  </Card>
+</CardGroup>

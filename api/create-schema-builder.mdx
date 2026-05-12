@@ -1,0 +1,112 @@
+---
+title: "createSchemaBuilder — Initialize the Schema Builder"
+description: "Bootstrap a type-safe SchemaBuilder instance from a Drizzle database and table tuple, with optional strict or lenient enforcement mode."
+---
+
+`createSchemaBuilder` is the entry point for configuring Drizzle Castor. It accepts a Drizzle database instance and a `const` tuple of table objects, returning a fluent `SchemaBuilder` you can chain to register policies, middleware, relations, and logging before calling `.build()`.
+
+## Signature
+
+```typescript
+function createSchemaBuilder<
+  TDb extends AnyDatabase,
+  TTables extends readonly AnyTable[],
+>(db: TDb, tables: TTables, mode?: "strict" | "lenient"): SchemaBuilder<TDb, TTables>
+```
+
+## Parameters
+
+<ParamField path="db" type="TDb extends AnyDatabase" required>
+  A Drizzle ORM database instance. `AnyDatabase` is a union of all supported
+  dialects:
+
+  <Expandable title="supported database types">
+    - `BunSQLiteDatabase`
+    - `BetterSQLite3Database`
+    - `LibSQLDatabase`
+    - `PostgresJsDatabase`
+    - `NodePgDatabase`
+    - `MySql2Database`
+    - `AnyD1Database`
+  </Expandable>
+</ParamField>
+
+<ParamField path="tables" type="TTables extends readonly AnyTable[]" required>
+  A **`const` tuple** of Drizzle table objects — `AnySQLiteTable`,
+  `AnyMySqlTable`, or `AnyPgTable`. The tuple must be declared with
+  `as const` so TypeScript can infer each table's literal name and column
+  types. Omitting `as const` degrades type inference for `.table()`,
+  `.policies()`, and `repoFactory()`.
+</ParamField>
+
+<ParamField path="mode" type='"strict" | "lenient"' default="lenient">
+  Controls how Castor behaves when a repository operation targets a table
+  that has no explicit policy registered.
+
+  | Mode | Behaviour |
+  |------|-----------|
+  | `"lenient"` | Tables without a policy allow **all actions** by default. A warning is logged at startup. Use this during development or when you prefer an opt-in security posture. |
+  | `"strict"` | Tables without a policy **immediately throw** an `AccessDeniedError`. Every table your application touches must have a policy registered via `.policies()`. Use this for production systems that require an explicit security posture. |
+</ParamField>
+
+## Return value
+
+Returns a `SchemaBuilder<TDb, TTables>` instance. The builder is fluent — every
+configuration method returns either `this` or a new `SchemaBuilder` with
+updated type parameters, so calls can be chained freely.
+
+## Example
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import { usersTable, postsTable } from "./schema";
+
+const db = drizzle("sqlite.db");
+
+const builder = createSchemaBuilder(
+  db,
+  [usersTable, postsTable] as const, // `as const` is required for type inference
+  "strict",
+);
+```
+
+<Warning>
+  Always pass the table array with `as const`. Without it, TypeScript widens
+  the tuple to `AnyTable[]`, and methods like `.table("users", ...)` will not
+  receive narrowed column or table-name types.
+</Warning>
+
+## Full setup example
+
+The snippet below mirrors the pattern used in the official quickstart: create the
+builder, define profiles, attach telemetry listeners, configure logging, and then
+register table metadata before calling `.build()`.
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import { usersTable, postsTable, profilesTable } from "./schema";
+
+const db = drizzle("sqlite.db");
+
+export const schemaMetadataBuilder = createSchemaBuilder(
+  db,
+  [usersTable, postsTable, profilesTable] as const,
+  "lenient",
+)
+  .profiles(["default", "public", "admin", "user"] as const)
+  .withLogger({ level: "INFO" })
+  .on("execution", (ev) => {
+    console.log(`[${ev.traceId}] ${ev.action} on ${ev.tableName} — ${ev.duration}ms`);
+  });
+
+export const schemaMetadata = schemaMetadataBuilder.build();
+```
+
+## Type parameters
+
+| Parameter | Constraint | Description |
+|-----------|-----------|-------------|
+| `TDb` | `AnyDatabase` | Inferred from the `db` argument. Carries the dialect through to repositories. |
+| `TTables` | `readonly AnyTable[]` | Inferred from the `tables` argument. Enables table-name and column-name literal inference throughout the builder chain. |

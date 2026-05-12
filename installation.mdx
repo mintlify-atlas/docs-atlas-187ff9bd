@@ -1,0 +1,126 @@
+---
+title: 'Install Drizzle Castor via npm or JSR'
+description: 'Install Drizzle Castor 0.1.2 using npm, pnpm, yarn, bun, or JSR. Covers peer dependencies, runtime requirements, and ESM/CJS export support.'
+---
+
+Drizzle Castor is published to both the npm registry (under the `@fajarnugraha37` scope) and the JSR registry (under the `@fajar` scope). Choose the registry that best fits your runtime and toolchain. Both distributions are functionally identical; the JSR package exports the TypeScript source directly, making it the preferred choice for Deno and ESM-first projects.
+
+## Install from npm
+
+The npm package ships pre-built CommonJS and ESM bundles along with TypeScript declaration files. It works with Bun, Node.js, and any bundler that supports the `exports` field in `package.json`.
+
+<CodeGroup>
+
+```bash bun
+bun add @fajarnugraha37/drizzle-castor
+```
+
+```bash npm
+npm install @fajarnugraha37/drizzle-castor
+```
+
+```bash pnpm
+pnpm add @fajarnugraha37/drizzle-castor
+```
+
+```bash yarn
+yarn add @fajarnugraha37/drizzle-castor
+```
+
+</CodeGroup>
+
+## Install from JSR
+
+The JSR package (`@fajar/drizzle-castor`) exports the raw TypeScript source and is recommended for Deno or projects that prefer ESM-first workflows.
+
+<CodeGroup>
+
+```bash bun
+bunx jsr add @fajar/drizzle-castor
+```
+
+```bash npx
+npx jsr add @fajar/drizzle-castor
+```
+
+```bash deno
+deno add jsr:@fajar/drizzle-castor
+```
+
+</CodeGroup>
+
+## Peer dependencies
+
+Drizzle Castor requires the following peer dependencies to be installed alongside it:
+
+| Package | Version | Notes |
+|---|---|---|
+| `drizzle-orm` | `^0.30` | Included as a direct dependency (0.45.2+) |
+| `typescript` | `^5.0` | Required for type inference; listed as a peer dependency |
+
+<Note>
+  `drizzle-orm` is declared as a direct dependency in Drizzle Castor's `package.json`, so your package manager will install it automatically. TypeScript is a peer dependency, meaning you must have it installed in your project separately.
+</Note>
+
+Install both together in one command:
+
+```bash bun
+bun add @fajarnugraha37/drizzle-castor drizzle-orm && bun add -d typescript
+```
+
+## Runtime requirements
+
+<CardGroup cols={2}>
+  <Card title="Bun 1.0+" icon="bolt">
+    Bun is the recommended runtime. The Bun SQLite adapter (`drizzle-orm/bun-sqlite`) works out of the box with no additional native dependencies.
+  </Card>
+  <Card title="Node.js" icon="server">
+    Node.js is fully supported. Use `better-sqlite3`, `pg`, or `mysql2` as your Drizzle database driver depending on your chosen dialect.
+  </Card>
+</CardGroup>
+
+## Current version
+
+The current stable release is **0.1.2** (npm) / **0.1.0** (JSR). You can verify the installed version at any time:
+
+```bash
+# npm / bun / pnpm / yarn
+cat node_modules/@fajarnugraha37/drizzle-castor/package.json | grep '"version"'
+```
+
+## ESM and CJS support
+
+The npm package uses the `exports` field in `package.json` to serve both module formats from the same installation:
+
+```json package.json (drizzle-castor)
+{
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  }
+}
+```
+
+- **ESM** (`import`): `./dist/index.js`
+- **CJS** (`require`): `./dist/index.cjs`
+- **TypeScript types**: `./dist/index.d.ts`
+
+No extra configuration is needed. Your bundler or runtime picks the correct format automatically based on your project's `"type"` field or the `import` / `require` call syntax you use.
+
+<Warning>
+  The JSR distribution exports the raw TypeScript source (`./src/index.ts`). It does not include pre-built CJS bundles. If you need CommonJS output from the JSR package, run it through your own TypeScript build step.
+</Warning>
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Configure the schema builder and run your first queries in under five minutes.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what Drizzle Castor is, the problems it solves, and how it works.
+  </Card>
+</CardGroup>

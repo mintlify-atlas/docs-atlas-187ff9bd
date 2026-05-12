@@ -1,0 +1,172 @@
+---
+title: "UpdateSet — Partial Updates with Dot-Notation"
+description: "Reference for UpdateSet: update regular columns and nested JSON properties using dot-notation paths, with per-dialect SQL translation and RBAC field control."
+---
+
+`UpdateSet<T>` describes the payload passed to `updateOne` and `updateMany`. Each key is a `ValidPath<T>` — a dot-notation string pointing to a column or a nested property inside a JSON column — and the corresponding value is the new value to write at that path. The library translates these keys into dialect-specific SQL at runtime: regular column updates become standard `SET col = value` clauses, while dot-notation paths targeting JSON columns are converted into `jsonb_set`, `JSON_SET`, or `json_set` calls depending on the database in use.
+
+## Type definition
+
+```typescript
+type UpdateSet<T> = {
+  [K in ValidPath<T>]?: ValueAt<T, K>;
+};
+```
+
+`ValidPath<T>` is the same recursive union used by `FilterQuery` and `SearchQuery`, so every path you can filter on you can also update. `ValueAt<T, K>` resolves to the exact TypeScript type at that path, giving you compile-time safety over the value you assign.
+
+## Key categories
+
+### Regular column updates
+
+Keys that map directly to a top-level column name produce a standard `SET column = value` SQL assignment.
+
+```typescript
+await userRepo.updateOne(1, {
+  name: "Jane Doe",
+  email: "jane@example.com"
+}, "admin");
+```
+
+Generated SQL (PostgreSQL / SQLite):
+
+```sql
+UPDATE "users"
+SET "name" = 'Jane Doe', "email" = 'jane@example.com'
+WHERE "users"."id" = 1
+RETURNING "id";
+```
+
+### JSON column partial updates
+
+Keys that contain a dot and resolve inside a JSON-typed column trigger a partial JSON mutation. The library merges the incoming value into the existing document rather than replacing the entire column, so untouched sibling keys are preserved.
+
+```typescript
+// Only settings.theme changes; settings.notifications is left intact
+await userRepo.updateOne(1, {
+  "settings.theme": "light"
+}, "admin");
+```
+
+<AccordionGroup>
+  <Accordion title="PostgreSQL — jsonb_set with COALESCE">
+    PostgreSQL uses nested `jsonb_set()` calls combined with `COALESCE` to handle `NULL` columns gracefully.
+
+    ```sql
+    UPDATE "users"
+    SET "settings" = jsonb_set(
+      COALESCE("settings", '{}'),
+      '{theme}',
+      '"light"'
+    )
+    WHERE "users"."id" = 1
+    RETURNING "id";
+    ```
+  </Accordion>
+
+  <Accordion title="MySQL — JSON_SET">
+    MySQL uses `JSON_SET()` with `CAST(value AS JSON)` to preserve object data types.
+
+    ```sql
+    UPDATE `users`
+    SET `settings` = JSON_SET(`settings`, '$.theme', CAST('"light"' AS JSON))
+    WHERE `users`.`id` = 1;
+    ```
+  </Accordion>
+
+  <Accordion title="SQLite — json_set">
+    SQLite uses `json_set()` with `json(value)`.
+
+    ```sql
+    UPDATE "users"
+    SET "settings" = json_set("settings", '$.theme', json('"light"'))
+    WHERE "users"."id" = 1
+    RETURNING "id";
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### JSON array index updates
+
+Numeric segments in the path are treated as zero-based array indices. The same dialect-specific JSON mutation functions handle array slots the same way they handle object properties.
+
+```typescript
+// Replace the first element of persona.skills
+await userRepo.updateOne(1, {
+  "persona.skills.0": "TypeScript"
+}, "admin");
+```
+
+SQLite translation:
+
+```sql
+UPDATE "users"
+SET "persona" = json_set("persona", '$.skills[0]', json('"TypeScript"'))
+WHERE "users"."id" = 1
+RETURNING "id";
+```
+
+## Full example
+
+The following call updates both a regular column and two nested JSON properties in a single round-trip:
+
+```typescript
+const updated = await userRepo.updateOne(1, {
+  name: "John Updated",
+  "settings.theme": "light",
+  "occupational.company": "Acme Corp"
+}, "admin");
+```
+
+The AST compiler groups keys by their root column. `name` becomes a direct column set, while `settings.theme` and `occupational.company` each become separate JSON mutation expressions targeting the `settings` and `occupational` columns respectively.
+
+## Batch updates with updateMany
+
+`updateMany` accepts a `FilterQuery<T>` as the first argument and an `UpdateSet<T>` as the second. The library builds an EXISTS subquery from the filter and applies the mutation to all matching rows atomically within a transaction.
+
+```typescript
+// Disable notifications for all users under 18
+await userRepo.updateMany(
+  { age: { $lt: 18 } },
+  { "settings.notifications": false },
+  "admin"
+);
+```
+
+On PostgreSQL and SQLite, this uses a `RETURNING`-based transaction. On MySQL, the library creates a temporary table to snapshot the target IDs before executing the update, avoiding race conditions. See the [multi-dialect](/advanced/multi-dialect) page for the full transaction strategies.
+
+## RBAC: allowedSets
+
+When RBAC is active, the `allowedSets` policy controls which keys in the `UpdateSet` are permitted for a given profile. Any key not listed is silently stripped from the payload before the query reaches the AST compiler.
+
+```typescript
+schemaMetadataBuilder.policies("users", {
+  user: async (ctx) => ({
+    allowedActions: ["read", "update"],
+    allowedSets: ["settings.theme", "persona.skills"],
+  }),
+  admin: {
+    allowedActions: "*",
+    allowedSets: "*",
+  }
+});
+```
+
+With the `user` profile active, an attempt to update `name` or `occupational.company` alongside the allowed paths results in those keys being stripped silently:
+
+```typescript
+// Calling as "user" profile — only settings.theme is written
+await userRepo.updateOne(1, {
+  name: "Hacked Name",            // stripped — not in allowedSets
+  "settings.theme": "dark",       // written
+  "occupational.company": "Evil"  // stripped — not in allowedSets
+}, "user");
+```
+
+<Note>
+  If stripping removes every key and the resulting `UpdateSet` is empty, the RBAC middleware throws an `AccessDeniedError` rather than executing a no-op update.
+</Note>
+
+## Path security
+
+All dot-notation paths in an `UpdateSet` are validated by `validateJsonPath()` before being passed to the dialect-specific JSON functions. This check restricts path strings strictly to alphanumerics, dots, and array indices, preventing SQL injection and prototype pollution from user-supplied keys.

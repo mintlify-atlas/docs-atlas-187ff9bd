@@ -1,0 +1,232 @@
+---
+title: "Extensible Middleware Pipeline in Drizzle Castor ORM"
+description: "Register Koa-style middleware with builder.use(), scope it to specific tables, and build cross-cutting concerns like caching and multi-tenant isolation."
+---
+
+Every repository method in Drizzle Castor runs through a composable middleware pipeline before any SQL reaches the database. The pipeline follows the Koa-style onion model — each middleware receives the execution context and a `next` function, can run logic before and after the downstream chain, and must return the result of `next()` to pass control forward. This design lets you stack cross-cutting concerns — logging, caching, multi-tenant isolation, rate limiting, audit trails — as thin, reusable layers without touching repository code.
+
+## How the pipeline works
+
+Drizzle Castor uses a `composeMiddleware` function (see `src/middleware/middleware.ts`) to merge an ordered array of middleware functions into a single dispatch chain. When you call a repository method, the composed pipeline is invoked with the current `ExecutionContext` and the core executor as the terminal `next`.
+
+```typescript
+// Simplified internal compose implementation
+function composeMiddleware(middleware) {
+  return function (context, next) {
+    let index = -1;
+    return dispatch(0);
+    function dispatch(i) {
+      if (i <= index)
+        return Promise.reject(new Error("next() called multiple times"));
+      index = i;
+      let fn = middleware[i];
+      if (i === middleware.length) fn = next;
+      if (!fn) return Promise.resolve();
+      try {
+        return Promise.resolve(fn(context, dispatch.bind(null, i + 1)));
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    }
+  };
+}
+```
+
+Execution order is: user-registered middleware runs **first**, in registration order, followed by the built-in Unified RBAC middleware, and finally the query executor. The RBAC middleware always runs last in the middleware stack — immediately before the executor — so your custom layers see the raw, unfiltered context and can mutate `ctx.state` before policy enforcement occurs.
+
+```text
+Request
+  └── Custom middleware 1 (registered first)
+        └── Custom middleware 2
+              └── Built-in RBAC middleware
+                    └── Query executor
+              ← RBAC result propagates up
+        ← Custom middleware 2 post-processing
+  ← Custom middleware 1 post-processing
+Response
+```
+
+## The ExecutionContext
+
+Every middleware receives `ctx`, an `ExecutionContext` object that carries the full scope of the in-flight operation. You can read from it, write to `ctx.state`, and use it for correlation across nested calls.
+
+<AccordionGroup>
+  <Accordion title="ctx.action">
+    The CRUD action being performed: `"create"`, `"read"`, `"update"`, `"softDelete"`, `"restore"`, or `"hardDelete"`.
+  </Accordion>
+  <Accordion title="ctx.tableName">
+    The name of the target table as a string (e.g., `"users"`).
+  </Accordion>
+  <Accordion title="ctx.profile">
+    The active RBAC profile string or array of strings passed to the repository method (e.g., `"admin"` or `["user", "editor"]`).
+  </Accordion>
+  <Accordion title="ctx.params">
+    A snapshot of the initial parameters: `query`, `data`, `id`, `filter`, and `set`. These reflect the caller's input before RBAC trimming.
+  </Accordion>
+  <Accordion title="ctx.state">
+    A mutable bag for sharing data between middleware layers in the same request. Initialized as an empty object; does not persist across requests.
+  </Accordion>
+  <Accordion title="ctx.traceId and ctx.spanId">
+    Unique identifiers for the trace and the current execution unit. `traceId` is shared across nested calls; `spanId` is unique per operation. Both are available in every log line automatically.
+  </Accordion>
+  <Accordion title="ctx.metadata">
+    User-provided contextual data attached to the trace — for example, a `userId` or `sessionId` injected by an outer middleware.
+  </Accordion>
+  <Accordion title="ctx.translatorContext">
+    Contains the Drizzle `db` instance, the registered table definitions, and the table metadata (relations, soft-delete config). Read-only for middleware.
+  </Accordion>
+</AccordionGroup>
+
+## Registering middleware
+
+Call `builder.use(middleware, config?)` on the schema builder before calling `.build()`. You can register multiple middleware functions; they execute in the order they are added.
+
+```typescript
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+
+const builder = createSchemaBuilder(db, [usersTable, postsTable] as const, "lenient")
+  .profiles(["admin", "user", "public"] as const)
+  .use(async (ctx, next) => {
+    // Runs before every database operation
+    console.log(`Executing ${ctx.action} on table ${ctx.tableName}`);
+    const result = await next();
+    // Runs after the operation completes
+    console.log(`Finished ${ctx.action}`);
+    return result;
+  });
+```
+
+### Scoping middleware to specific tables or actions
+
+Pass a `MiddlewareConfig` object as the second argument to restrict when your middleware fires. The `tables` property accepts a single table name or an array of names. The `actions` property accepts a single `DbAction` string or an array.
+
+```typescript
+import type { MiddlewareConfig } from "@fajarnugraha37/drizzle-castor";
+
+const auditConfig: MiddlewareConfig = {
+  tables: ["users", "posts"],  // Only runs for these tables
+  actions: ["create", "update", "hardDelete"],  // Only on mutations
+};
+
+builder.use(async (ctx, next) => {
+  const result = await next();
+  console.log(`[Audit] ${ctx.action} on ${ctx.tableName} by profile ${ctx.profile}`);
+  return result;
+}, auditConfig);
+```
+
+<Note>
+  If you omit `tables` or `actions` from the config, the middleware applies to all tables and all actions respectively.
+</Note>
+
+## Practical examples
+
+### Timing middleware
+
+Measure and log the duration of every query execution using `ctx.traceId` for correlation across concurrent requests.
+
+```typescript
+builder.use(async (ctx, next) => {
+  const start = performance.now();
+  try {
+    const result = await next();
+    const duration = performance.now() - start;
+    console.log(
+      `[${ctx.traceId}] ${ctx.action} on ${ctx.tableName} completed in ${duration.toFixed(2)}ms`
+    );
+    return result;
+  } catch (err) {
+    const duration = performance.now() - start;
+    console.error(
+      `[${ctx.traceId}] ${ctx.action} on ${ctx.tableName} failed after ${duration.toFixed(2)}ms`,
+      err
+    );
+    throw err;
+  }
+});
+```
+
+### Tenant context injection
+
+In a multi-tenant application, inject the tenant identifier into `ctx.state` so downstream middleware and dynamic policies can access it without re-deriving it from the request.
+
+```typescript
+builder.use(async (ctx, next) => {
+  // Derive tenantId from external request context (e.g., AsyncLocalStorage)
+  const tenantId = requestContext.get("tenantId");
+  ctx.state.tenantId = tenantId;
+
+  return next();
+});
+
+// A later middleware or dynamic policy can read ctx.state.tenantId
+builder.policies("users", {
+  user: async (ctx) => ({
+    allowedActions: ["read", "update"],
+    allowedFilters: ["tenantId", "name", "email"],
+    allowedProjections: ["*"],
+    allowedSorts: "*",
+    allowedSets: ["settings.theme"],
+  }),
+});
+```
+
+<Tip>
+  Use `ctx.state` to pass computed values (resolved tenant, decoded token claims, rate-limit tokens) between middleware layers rather than repeating expensive lookups in each layer.
+</Tip>
+
+### Caching middleware (table-scoped)
+
+Use `MiddlewareConfig` to scope a caching layer exclusively to read operations on the `products` table without affecting writes or other tables.
+
+```typescript
+const cacheConfig: MiddlewareConfig = {
+  tables: ["products"],
+  actions: ["read"],
+};
+
+builder.use(async (ctx, next) => {
+  const cacheKey = `${ctx.tableName}:${JSON.stringify(ctx.params.query)}`;
+  const cached = await cache.get(cacheKey);
+  if (cached) return cached;
+
+  const result = await next();
+  await cache.set(cacheKey, result, { ttl: 60 });
+  return result;
+}, cacheConfig);
+```
+
+## Middleware type reference
+
+<AccordionGroup>
+  <Accordion title="Middleware<T, TDb, TTables>">
+    The core middleware function signature: `(ctx: ExecutionContext<TDb, TTables>, next: MiddlewareNext<T>) => Promise<T>`. The generic `T` is the return type of the executor.
+  </Accordion>
+  <Accordion title="MiddlewareNext<T>">
+    A zero-argument function that returns `Promise<T>`. Calling it advances the pipeline to the next middleware or the executor.
+  </Accordion>
+  <Accordion title="MiddlewareConfig<TTables>">
+    Optional scope config: `{ tables?: TableName | TableName[]; actions?: DbAction | DbAction[] }`. Omitting either field means "all".
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+  Calling `next()` more than once in a single middleware function will reject with `"next() called multiple times"`. The pipeline is designed for single-pass execution per request.
+</Warning>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Telemetry & Events" icon="chart-line" href="/middleware/telemetry">
+    Subscribe to structured events emitted by the pipeline for metrics, auditing, and observability.
+  </Card>
+  <Card title="Logging" icon="file-lines" href="/middleware/logging">
+    Configure pattern-based, pino-powered logging with traceId correlation built in.
+  </Card>
+  <Card title="Access Control overview" icon="shield" href="/access-control/overview">
+    Understand how the built-in RBAC middleware enforces action-level and field-level policies.
+  </Card>
+  <Card title="Schema builder methods" icon="wrench" href="/api/schema-builder-methods">
+    Full reference for builder.use(), builder.policies(), builder.withLogger(), and more.
+  </Card>
+</CardGroup>

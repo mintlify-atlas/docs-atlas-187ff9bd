@@ -1,0 +1,435 @@
+---
+title: "Defining Table Relations in Drizzle Castor"
+description: "Register oneToOne, oneToMany, manyToOne, and manyToMany relations via builder.table(). Learn how paths like posts.comments.content resolve to SQL JOINs."
+---
+
+Drizzle Castor manages table relationships in its own metadata layer, separate from Drizzle's native relation system. You register every relation by calling `builder.table(tableName, config)` on the schema builder. At query time, the AST translator reads this registry to decide which `LEFT JOIN` statements to emit and how to wire up foreign keys — all without any manual SQL. The same table call also configures soft-delete behaviour, keeping both concerns co-located.
+
+## Registering a table with `builder.table()`
+
+`builder.table(tableName, config)` returns a **new** `SchemaBuilder` instance with the table config merged into the type-level metadata map. You can chain multiple `.table()` calls fluently.
+
+<ParamField path="tableName" type="string" required>
+  Must match the Drizzle table's `._name` value exactly. TypeScript narrows this to `TableName<TTables[number]>`.
+</ParamField>
+
+<ParamField path="config" type="TSchemaMetadata[tableName]" required>
+  An object that may contain any combination of `oneToOne`, `oneToMany`, `manyToOne`, `manyToMany`, and `softDelete`.
+</ParamField>
+
+```typescript
+const builder = createSchemaBuilder(db, [
+  usersTable,
+  postsTable,
+  commentsTable,
+  profilesTable,
+  companiesTable,
+  groupsTable,
+  userGroups,
+] as const);
+
+const configured = builder
+  .table("users", { /* ... */ })
+  .table("posts", { /* ... */ })
+  .table("comments", { /* ... */ });
+```
+
+## Relation types
+
+Castor supports four relation types. Every relation node requires at minimum a `relationName`, a `relatedTable`, and the key pair that joins the two tables.
+
+### `oneToOne`
+
+A 1:1 relation where the local table holds the primary key and the related table holds a foreign key pointing back (or vice versa). Query results hydrate as a single nested object rather than an array.
+
+```typescript
+builder.table("users", {
+  oneToOne: [
+    {
+      relationName: "profile",   // used as the key in the hydrated result
+      relatedTable: "profiles",  // must match the Drizzle table name
+      localKey:     "users.id",      // table.column on the owning side
+      foreignKey:   "profiles.userId", // table.column on the related side
+    },
+  ],
+});
+```
+
+Querying `projection: ["profile.bio"]` on a `users` repository now emits:
+
+```sql
+LEFT JOIN "profiles" AS "rel_profile" ON "users"."id" = "rel_profile"."user_id"
+```
+
+And the hydrated output is:
+
+```json
+{
+  "id": 1,
+  "name": "Jane",
+  "profile": { "bio": "Backend Developer" }
+}
+```
+
+### `oneToMany`
+
+A 1:N relation where one local row corresponds to many rows on the related table. Query results hydrate as an array nested under the relation name.
+
+```typescript
+builder.table("users", {
+  oneToMany: [
+    {
+      relationName: "posts",
+      relatedTable: "posts",
+      localKey:     "users.id",
+      foreignKey:   "posts.userId",
+    },
+  ],
+});
+```
+
+```json
+{
+  "id": 1,
+  "name": "Jane",
+  "posts": [
+    { "id": 10, "title": "First Post" },
+    { "id": 11, "title": "Second Post" }
+  ]
+}
+```
+
+### `manyToOne`
+
+A N:1 relation where the local table holds the foreign key. The hydrated result is a single nested object (not an array) because each local row belongs to exactly one parent.
+
+```typescript
+builder.table("posts", {
+  manyToOne: [
+    {
+      relationName: "author",
+      relatedTable: "users",
+      localKey:     "posts.userId",  // FK lives on the posts side
+      foreignKey:   "users.id",
+    },
+  ],
+});
+```
+
+```json
+{
+  "id": 10,
+  "title": "First Post",
+  "author": { "id": 1, "name": "Jane" }
+}
+```
+
+### `manyToMany`
+
+A M:N relation that requires a join table. Castor joins through the junction table automatically; you never need to query it directly.
+
+<ParamField path="joinTable" type="string" required>
+  The name of the junction table (e.g., `"users_to_groups"`).
+</ParamField>
+
+<ParamField path="joinLocalKey" type="string" required>
+  The column on the join table that references the local table's primary key (e.g., `"users_to_groups.userId"`).
+</ParamField>
+
+<ParamField path="joinRelatedKey" type="string" required>
+  The column on the join table that references the related table's primary key (e.g., `"users_to_groups.groupId"`).
+</ParamField>
+
+<ParamField path="localKey" type="string" required>
+  The primary key column on the local table (e.g., `"users.id"`).
+</ParamField>
+
+<ParamField path="relatedKey" type="string" required>
+  The primary key column on the related table (e.g., `"groups.id"`).
+</ParamField>
+
+```typescript
+builder.table("users", {
+  manyToMany: [
+    {
+      relationName:  "groups",
+      relatedTable:  "groups",
+      joinTable:     "users_to_groups",
+      joinLocalKey:  "users_to_groups.userId",
+      joinRelatedKey: "users_to_groups.groupId",
+      localKey:      "users.id",
+      relatedKey:    "groups.id",
+    },
+  ],
+});
+```
+
+Castor emits two joins for this configuration:
+
+```sql
+LEFT JOIN "users_to_groups" AS "rel_groups_jt"
+  ON "users"."id" = "rel_groups_jt"."user_id"
+LEFT JOIN "groups" AS "rel_groups"
+  ON "rel_groups_jt"."group_id" = "rel_groups"."id"
+```
+
+The hydrated result is an array:
+
+```json
+{
+  "id": 1,
+  "name": "Jane",
+  "groups": [
+    { "id": 3, "name": "Engineering" },
+    { "id": 7, "name": "Open Source" }
+  ]
+}
+```
+
+## The `RelationNode` shape
+
+Castor stores every registered relation as a `RelationNode` object internally. Understanding this shape helps when reading error messages or extending the library.
+
+<Expandable title="RelationNode fields">
+  <ResponseField name="relationName" type="string" required>
+    The key used in the hydrated output and in dot-notation paths (e.g., `"posts"`, `"profile"`).
+  </ResponseField>
+  <ResponseField name="relatedTable" type="string" required>
+    The Drizzle table name of the related table.
+  </ResponseField>
+  <ResponseField name="type" type='"oneToMany" | "manyToMany" | "oneToOne" | "manyToOne"' required>
+    The cardinality of this relation.
+  </ResponseField>
+  <ResponseField name="isArray" type="boolean" required>
+    `true` for `oneToMany` and `manyToMany`; `false` for `oneToOne` and `manyToOne`. Controls whether the hydrator places results in an array or a plain object.
+  </ResponseField>
+  <ResponseField name="localKey" type="string">
+    `table.column` reference on the owning side.
+  </ResponseField>
+  <ResponseField name="foreignKey" type="string">
+    `table.column` reference on the related side.
+  </ResponseField>
+  <ResponseField name="joinTable" type="string">
+    M:N only. Name of the junction table.
+  </ResponseField>
+  <ResponseField name="joinLocalKey" type="string">
+    M:N only. `joinTable.column` that references the local primary key.
+  </ResponseField>
+  <ResponseField name="relatedKey" type="string">
+    M:N only. Primary key column on the related table.
+  </ResponseField>
+  <ResponseField name="joinRelatedKey" type="string">
+    M:N only. `joinTable.column` that references the related primary key.
+  </ResponseField>
+</Expandable>
+
+## How nested paths are resolved
+
+When a query contains a path like `"posts.comments.content"`, the AST translator resolves each segment step by step:
+
+<Steps>
+  <Step title="Segment 1: posts">
+    The translator looks up the `users` metadata and finds a `oneToMany` relation with `relationName: "posts"`. It records the alias `rel_posts` and the join condition `users.id = rel_posts.userId`.
+  </Step>
+  <Step title="Segment 2: comments">
+    The translator looks up the `posts` metadata and finds a `oneToMany` relation with `relationName: "comments"`. It records the alias `rel_posts_comments` and the join condition `rel_posts.id = rel_posts_comments.postId`.
+  </Step>
+  <Step title="Segment 3: content">
+    `content` is a direct column on `commentsTable`. The translator maps it to `rel_posts_comments.content` in the SELECT list.
+  </Step>
+</Steps>
+
+The resulting SQL fragment looks like:
+
+```sql
+LEFT JOIN "posts"    AS "rel_posts"
+  ON "users"."id" = "rel_posts"."userId"
+LEFT JOIN "comments" AS "rel_posts_comments"
+  ON "rel_posts"."id" = "rel_posts_comments"."postId"
+```
+
+The hydrator then folds the flat rows back into the nested shape:
+
+```json
+{
+  "posts": [
+    {
+      "comments": [
+        { "content": "Great post!" }
+      ]
+    }
+  ]
+}
+```
+
+## Soft-delete configuration
+
+The `softDelete` key on a table config enables soft-delete and restore behaviour. When set, active queries automatically exclude soft-deleted rows, and soft-delete join conditions are injected into any `LEFT JOIN` involving this table.
+
+<ParamField path="softDelete.deleteValue" type="Record<string, any>" required>
+  The column values written when `softDeleteOne` or `softDeleteMany` is called. Each key must be a valid column name.
+</ParamField>
+
+<ParamField path="softDelete.restoreValue" type="Record<string, any>" required>
+  The column values written when `restoreOne` or `restoreMany` is called.
+</ParamField>
+
+```typescript
+builder.table("users", {
+  softDelete: {
+    deleteValue:  { deletedFlag: 1 },
+    restoreValue: { deletedFlag: 0 },
+  },
+});
+```
+
+When this config is present, every `searchOne`, `searchMany`, and `searchPage` call on the `users` repository automatically appends `WHERE "users"."deleted_flag" = 0` (or the equivalent condition for your dialect). The same filter is also injected into any join involving `users` as the related table, so nested queries on `posts` that join up to `users` will not surface deleted user records.
+
+## Full example using the example schema
+
+The following registers the complete set of tables from `example/schema.ts`, covering all four relation types and soft-delete configuration.
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { createSchemaBuilder } from "@fajarnugraha37/drizzle-castor";
+import {
+  usersTable,
+  postsTable,
+  commentsTable,
+  profilesTable,
+  companiesTable,
+  groupsTable,
+  userGroups,
+} from "./schema";
+
+const db = drizzle("sqlite.db");
+
+export const schemaMetadata = createSchemaBuilder(
+  db,
+  [
+    usersTable,
+    postsTable,
+    commentsTable,
+    profilesTable,
+    companiesTable,
+    groupsTable,
+    userGroups,
+  ] as const,
+  "lenient",
+)
+  .table("users", {
+    // 1:1 — each user has one profile
+    oneToOne: [
+      {
+        relationName: "profile",
+        relatedTable: "profiles",
+        localKey:     "users.id",
+        foreignKey:   "profiles.userId",
+      },
+    ],
+    // 1:N — each user has many posts
+    oneToMany: [
+      {
+        relationName: "posts",
+        relatedTable: "posts",
+        localKey:     "users.id",
+        foreignKey:   "posts.userId",
+      },
+    ],
+    // M:N — each user belongs to many groups via users_to_groups
+    manyToMany: [
+      {
+        relationName:   "groups",
+        relatedTable:   "groups",
+        joinTable:      "users_to_groups",
+        joinLocalKey:   "users_to_groups.userId",
+        joinRelatedKey: "users_to_groups.groupId",
+        localKey:       "users.id",
+        relatedKey:     "groups.id",
+      },
+    ],
+    // Soft delete configuration
+    softDelete: {
+      deleteValue:  { deletedFlag: 1 },
+      restoreValue: { deletedFlag: 0 },
+    },
+  })
+  .table("posts", {
+    // N:1 — each post belongs to one user
+    manyToOne: [
+      {
+        relationName: "author",
+        relatedTable: "users",
+        localKey:     "posts.userId",
+        foreignKey:   "users.id",
+      },
+    ],
+    // 1:N — each post has many comments
+    oneToMany: [
+      {
+        relationName: "comments",
+        relatedTable: "comments",
+        localKey:     "posts.id",
+        foreignKey:   "comments.postId",
+      },
+    ],
+    softDelete: {
+      deleteValue:  { deletedFlag: 1 },
+      restoreValue: { deletedFlag: 0 },
+    },
+  })
+  .table("comments", {
+    manyToOne: [
+      {
+        relationName: "post",
+        relatedTable: "posts",
+        localKey:     "comments.postId",
+        foreignKey:   "posts.id",
+      },
+    ],
+    softDelete: {
+      deleteValue:  { deletedFlag: 1 },
+      restoreValue: { deletedFlag: 0 },
+    },
+  })
+  .build();
+```
+
+Once built, deep relational paths are available anywhere in the query API:
+
+```typescript
+const userRepo = schemaMetadata.repoFactory("users");
+
+const result = await userRepo.searchOne(
+  {
+    projection: [
+      "name",
+      "profile.bio",
+      "posts.title",
+      "posts.comments.content",
+      "groups.name",
+    ],
+    filter: {
+      "posts.title": { $like: "%Drizzle%" },
+    },
+  },
+  "admin",
+);
+```
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="JSON-based querying" icon="filter" href="/concepts/json-querying">
+    See how relational dot-notation paths are used in filters, projections, and order queries.
+  </Card>
+  <Card title="Soft deletes" icon="trash" href="/advanced/soft-deletes">
+    Learn the full lifecycle of soft-deleted records and how to query them explicitly.
+  </Card>
+  <Card title="Schema builder" icon="wrench" href="/concepts/schema-builder">
+    Understand the complete builder API that wraps relation and policy registration.
+  </Card>
+  <Card title="API: schema builder methods" icon="code" href="/api/schema-builder-methods">
+    Full API reference for all SchemaBuilder methods including table() overloads.
+  </Card>
+</CardGroup>
